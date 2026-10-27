@@ -45,7 +45,7 @@ SANITIZED_ERROR_LABELS = {
     400: "400 – ogiltig begäran/konfiguration",
     401: "401 – autentiseringsfel",
     403: "403 – behörighet saknas",
-    404: "404 – modellen hittades inte",
+    404: "404 – modellen ej anropbar",
     429: "429 – kapacitetsbegränsning",
     500: "500 – internt serverfel hos API",
     502: "502 – dålig gateway",
@@ -164,6 +164,7 @@ def build_generation_config(
     system_instruction: str,
     temperature: float,
     thinking_level: str,
+    grounding: bool = True,
 ) -> tuple[genai.types.GenerateContentConfig, str]:
     """
     Bygger GenerateContentConfig anpassad efter modellfamilj och installerad SDK-version.
@@ -172,12 +173,13 @@ def build_generation_config(
     config_kwargs: dict = {
         "system_instruction": system_instruction,
         "temperature": temperature,
-        "tools": [{"google_search": {}}],
     }
+    if grounding:
+        config_kwargs["tools"] = [{"google_search": {}}]
 
-    # store=False förhindrar serverlagring av källkod, om SDK:n stöder fältet
+    # store=False är opt-in (GEMINI_OPT_OUT_STORAGE=true) och sätts bara om SDK:n har fältet
     gen_config_fields = getattr(genai.types.GenerateContentConfig, "model_fields", {})
-    if "store" in gen_config_fields:
+    if os.getenv("GEMINI_OPT_OUT_STORAGE", "").strip().lower() == "true" and "store" in gen_config_fields:
         config_kwargs["store"] = False
 
     applied_thinking = "none (stöds ej av SDK)"
@@ -198,6 +200,10 @@ def build_generation_config(
             applied_thinking = thinking_level
 
     return genai.types.GenerateContentConfig(**config_kwargs), applied_thinking
+
+
+def error_code(err: Exception) -> Optional[int]:
+    return getattr(err, "code", None) if isinstance(err, APIError) else None
 
 
 def classify_error(err: Exception) -> tuple[bool, str]:
@@ -247,6 +253,7 @@ def format_audit_block(
     fallback_used: bool,
     fallback_reason: str,
     role_source: str,
+    grounding_desc: str = "aktiv",
 ) -> str:
     """Skapar ett konsekvent revisionsblock för både lyckade och misslyckade körningar."""
     lines = [
@@ -258,6 +265,7 @@ def format_audit_block(
     ]
     if fallback_reason:
         lines.append(f"- **Orsak:** `{fallback_reason}`")
+    lines.append(f"- **Grounding:** `{grounding_desc}`")
     lines.append(f"- **Rollkälla:** `{role_source}`")
     return "\n".join(lines)
 
@@ -294,6 +302,8 @@ def run_resilient_generation(
     profile = PROFILES.get(profile_name) or PROFILES["deep_investigation"]
     requested_model = os.getenv("GEMINI_MODEL", "").strip() or profile.primary_model
 
+    grounding_desc = "aktiv"
+
     def failure(reasons: list[str], thinking: str) -> GenerationResult:
         return GenerationResult(
             success=False,
@@ -306,6 +316,7 @@ def run_resilient_generation(
                 fallback_used=False,
                 fallback_reason="; ".join(reasons),
                 role_source=role_source,
+                grounding_desc=grounding_desc,
             ),
             chosen_model=None,
             requested_model=requested_model,
@@ -324,17 +335,25 @@ def run_resilient_generation(
     final_response = None
 
     for model_name in candidate_models:
-        config, applied_thinking = build_generation_config(
-            model_name=model_name,
-            system_instruction=system_instruction,
-            temperature=temperature,
-            thinking_level=profile.thinking_level,
-        )
+        grounding = True
+
+        def make_config():
+            return build_generation_config(
+                model_name=model_name,
+                system_instruction=system_instruction,
+                temperature=temperature,
+                thinking_level=profile.thinking_level,
+                grounding=grounding,
+            )
+
+        config, applied_thinking = make_config()
 
         delay = 5
         abort_all = False
+        attempt = 0
 
-        for attempt in range(1, 4):
+        while attempt < 3:
+            attempt += 1
             try:
                 resp = client.models.generate_content(
                     model=model_name,
@@ -342,8 +361,23 @@ def run_resilient_generation(
                     config=config,
                 )
             except Exception as err:
-                is_retryable, sanitized_reason = classify_error(err)
-                if not is_retryable:
+                code = error_code(err)
+                _, sanitized_reason = classify_error(err)
+
+                # Nekat Search Grounding (kvot/stöd): ett sista försök utan verktyget på samma modell
+                if grounding and code in (400, 429):
+                    grounding = False
+                    grounding_desc = "avaktiverad (kvot/stöd saknas)"
+                    config, applied_thinking = make_config()
+                    attempt -= 1
+                    continue
+
+                # 404 på en enskild modell: gå vidare till nästa tillåtna modell
+                if code == 404:
+                    fallback_reasons.append(f"{model_name}: {sanitized_reason}")
+                    break
+
+                if not classify_error(err)[0]:
                     fallback_reasons.append(f"{model_name}: {sanitized_reason}")
                     abort_all = True
                     break
@@ -381,6 +415,7 @@ def run_resilient_generation(
             fallback_used=chosen_model != requested_model,
             fallback_reason="; ".join(fallback_reasons),
             role_source=role_source,
+            grounding_desc=grounding_desc,
         ),
         chosen_model=chosen_model,
         requested_model=requested_model,

@@ -86,7 +86,7 @@ def test_pinned_model_must_be_available(monkeypatch):
     assert "inte tillgänglig" in result.audit_md
 
 
-@pytest.mark.parametrize("code", [400, 401, 403, 404])
+@pytest.mark.parametrize("code", [401, 403])
 def test_non_retryable_errors_stop_without_fallback(monkeypatch, code):
     fake = install(monkeypatch, list(c.ALL_APPROVED_MODELS), {m: api_error(code) for m in c.ALL_APPROVED_MODELS})
     result = run()
@@ -160,3 +160,45 @@ def test_load_system_role_sources(monkeypatch, tmp_path):
     (tmp_path / ".github").mkdir()
     (tmp_path / ".github" / "gemini_role.md").write_text("filrole")
     assert c.load_system_role("d") == ("filrole", ".github/gemini_role.md")
+
+
+def test_400_without_grounding_still_aborts(monkeypatch):
+    fake = install(monkeypatch, list(c.ALL_APPROVED_MODELS), {m: api_error(400) for m in c.ALL_APPROVED_MODELS})
+    result = run()
+    assert not result.success
+    assert fake.models.calls == ["gemini-4-argon", "gemini-4-argon"]  # med och utan grounding
+    assert "avaktiverad" in result.audit_md
+
+
+def test_404_falls_back_to_next_model(monkeypatch):
+    outcomes = {
+        "gemini-4-argon": api_error(404),
+        "gemini-3.1-pro-preview": ok_response(),
+        "gemini-2.5-pro": ok_response(),
+    }
+    install(monkeypatch, list(outcomes), outcomes)
+    result = run()
+    assert result.success and result.chosen_model == "gemini-3.1-pro-preview"
+    assert "404 – modellen ej anropbar" in result.audit_md
+
+
+def test_grounding_dropped_on_429_then_succeeds(monkeypatch):
+    class Models(FakeModels):
+        def generate_content(self, model, contents, config):
+            self.calls.append((model, bool(getattr(config, "tools", None))))
+            if getattr(config, "tools", None):
+                raise api_error(429)
+            return ok_response()
+
+    fake = install(monkeypatch, list(c.ALL_APPROVED_MODELS), {})
+    fake.models = Models(list(c.ALL_APPROVED_MODELS), {})
+    result = run()
+    assert result.success and result.chosen_model == "gemini-4-argon"
+    assert fake.models.calls == [("gemini-4-argon", True), ("gemini-4-argon", False)]
+    assert "Grounding:** `avaktiverad (kvot/stöd saknas)`" in result.audit_md
+
+
+def test_store_is_opt_in(monkeypatch):
+    monkeypatch.delenv("GEMINI_OPT_OUT_STORAGE", raising=False)
+    cfg, _ = c.build_generation_config("gemini-4-argon", "s", 0.1, "high")
+    assert getattr(cfg, "store", None) is None
