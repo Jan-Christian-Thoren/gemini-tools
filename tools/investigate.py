@@ -50,8 +50,8 @@ def main():
         except Exception as e:
             print(f"Kunde inte läsa {path}: {e}")
 
-    context_block = "\n---\n### Källkodsfiler från repot\n" + "\n".join(attached_files) if attached_files else ""
-
+    context_block = ("\n---\n### Källkodsfiler från repot\n" + "\n".join(attached_files)) if attached_files else ""
+    
     prompt = f"""
 ### Uppdragsbeskrivning (GitHub Issue #{issue_number})
 **Titel:** {issue.title}
