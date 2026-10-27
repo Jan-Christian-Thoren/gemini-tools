@@ -1,11 +1,72 @@
 import os
-import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 from github import Github
 from google import genai
 from google.genai.errors import APIError
 import httpx
+
+
+@dataclass(frozen=True)
+class ExecutionProfile:
+    name: str
+    primary_model: str
+    allowed_fallbacks: tuple[str, ...]
+    thinking_level: str
+
+
+PROFILES: dict[str, ExecutionProfile] = {
+    "deep_investigation": ExecutionProfile(
+        name="deep_investigation",
+        primary_model="gemini-4-argon",
+        allowed_fallbacks=("gemini-3.1-pro-preview", "gemini-2.5-pro"),
+        thinking_level="high",
+    ),
+    "standard_review": ExecutionProfile(
+        name="standard_review",
+        primary_model="gemini-3.8-flash",
+        allowed_fallbacks=("gemini-3.1-pro-preview",),
+        thinking_level="medium",
+    ),
+}
+
+ALL_APPROVED_MODELS = {
+    "gemini-4-argon",
+    "gemini-3.1-pro-preview",
+    "gemini-2.5-pro",
+    "gemini-3.8-flash",
+}
+
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+SANITIZED_ERROR_LABELS = {
+    400: "400 – ogiltig begäran/konfiguration",
+    401: "401 – autentiseringsfel",
+    403: "403 – behörighet saknas",
+    404: "404 – modellen hittades inte",
+    429: "429 – kapacitetsbegränsning",
+    500: "500 – internt serverfel hos API",
+    502: "502 – dålig gateway",
+    503: "503 – tjänsten tillfälligt otillgänglig",
+    504: "504 – timeout mot upstream",
+}
+
+
+class RunConfigError(Exception):
+    """Konfigurationsfel med ett eget, redan sanerat meddelande."""
+
+
+@dataclass
+class GenerationResult:
+    success: bool
+    text: str
+    sources_md: str
+    audit_md: str
+    chosen_model: Optional[str]
+    requested_model: str
+
 
 def get_github_context():
     """Hämtar och initierar GitHub-klienten och måltrepot."""
@@ -16,127 +77,311 @@ def get_github_context():
     gh = Github(token)
     return gh, gh.get_repo(repo_name)
 
-def load_system_role(default_role: str) -> str:
+
+def load_system_role(default_role: str) -> tuple[str, str]:
     """
     Läser in .github/gemini_role.md från det anropande repot.
-    Faller tillbaka på repots miljövariabel eller angiven default-roll.
+    Returnerar (rolltext, rollkälla).
     """
     role_candidates = [
         Path(".github/gemini_role.md"),
-        Path(".github/gemini-role.md")
+        Path(".github/gemini-role.md"),
     ]
     for path in role_candidates:
         if path.is_file():
             content = path.read_text(encoding="utf-8").strip()
             if content:
-                print(f"Laddade lokal domänroll från: {path}")
-                return content
+                return content, path.as_posix()
 
     env_role = os.environ.get("GEMINI_SYSTEM_ROLE", "").strip()
     if env_role:
-        print("Laddade roll från miljövariabeln GEMINI_SYSTEM_ROLE.")
-        return env_role
+        return env_role, "env:GEMINI_SYSTEM_ROLE"
 
-    print("Ingen lokal rollfil hittades, använder standardsystemroll.")
-    return default_role
+    return default_role, "default"
 
-def get_gemini_client():
+
+def get_gemini_client() -> genai.Client:
     """Initierar Google GenAI-klienten."""
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
-        raise ValueError("Miljövariabeln GEMINI_API_KEY saknas.")
+        raise RunConfigError("GEMINI_API_KEY saknas")
     return genai.Client(api_key=key)
 
-def discover_candidate_models(client: genai.Client) -> list[str]:
-    """Hämtar tillgängliga modeller i runtime och prioriterar Pro före Flash."""
-    print("Identifierar tillgängliga modeller via API:et...")
-    available = []
+
+def fetch_available_models(client: genai.Client) -> set[str]:
+    """Hämtar alla modeller på kontot som stöder generateContent."""
+    available = set()
+    for model in client.models.list():
+        name = (model.name or "").removeprefix("models/")
+        actions = (
+            getattr(model, "supported_actions", None)
+            or getattr(model, "supported_generation_methods", None)
+        )
+        if actions and "generateContent" not in actions:
+            continue
+        if name:
+            available.add(name)
+    return available
+
+
+def discover_candidate_models(
+    client: genai.Client,
+    profile_name: str = "deep_investigation",
+) -> tuple[list[str], str]:
+    """
+    Returnerar (kandidatlista, begärd_förstahandsmodell) enligt profil eller GEMINI_MODEL.
+    Verifierar alltid att valda modeller är tillgängliga via API:et.
+    """
+    if profile_name not in PROFILES:
+        raise RunConfigError(f"okänd exekveringsprofil: {profile_name}")
+
+    profile = PROFILES[profile_name]
+    pinned = os.getenv("GEMINI_MODEL", "").strip()
+
+    if pinned and pinned not in ALL_APPROVED_MODELS:
+        raise RunConfigError(f"ej godkänd modell i GEMINI_MODEL: {pinned}")
+
+    requested_primary = pinned if pinned else profile.primary_model
+    desired_order = (pinned,) if pinned else (profile.primary_model, *profile.allowed_fallbacks)
+
     try:
-        for m in client.models.list():
-            actions = getattr(m, "supported_actions", []) or getattr(m, "supported_generation_methods", [])
-            if "generateContent" in actions:
-                available.append(m.name.replace("models/", ""))
-    except Exception as err:
-        print(f"Kunde inte lista modeller dynamiskt ({err}). Använder nödlista.")
-        available = ["gemini-2.5-pro", "gemini-2.5-flash"]
+        available = fetch_available_models(client)
+    except Exception as exc:
+        raise RunConfigError("kunde inte verifiera modellutbud mot Gemini API") from exc
 
-    def sort_key(name: str):
-        low = name.lower()
-        if "pro" in low:
-            return (0, low)
-        elif "flash" in low:
-            return (1, low)
-        return (2, low)
+    if pinned and pinned not in available:
+        raise RunConfigError(f"fastlåst modell ({pinned}) är inte tillgänglig för detta API-konto")
 
-    ordered = sorted(available, key=sort_key)
-    print(f"Prioriterad modellordning: {ordered[:3]}")
-    return ordered
+    candidates = [m for m in desired_order if m in available]
+    if not candidates:
+        raise RunConfigError("ingen godkänd analysmodell för profilen är tillgänglig")
 
-def run_resilient_generation(prompt: str, system_instruction: str, temperature: float = 0.1):
-    """Kör modellförfrågan med Search Grounding, modell-fallback och felhantering."""
-    client = get_gemini_client()
-    candidate_models = discover_candidate_models(client)
+    return candidates, requested_primary
 
-    config = genai.types.GenerateContentConfig(
-        system_instruction=system_instruction,
-        temperature=temperature,
-        tools=[{"google_search": {}}],
-    )
 
-    response = None
-    chosen_model = None
+def build_generation_config(
+    model_name: str,
+    system_instruction: str,
+    temperature: float,
+    thinking_level: str,
+) -> tuple[genai.types.GenerateContentConfig, str]:
+    """
+    Bygger GenerateContentConfig anpassad efter modellfamilj och installerad SDK-version.
+    Returnerar (config, faktiskt_applicerad_resonemangsnivå).
+    """
+    config_kwargs: dict = {
+        "system_instruction": system_instruction,
+        "temperature": temperature,
+        "tools": [{"google_search": {}}],
+    }
+
+    # store=False förhindrar serverlagring av källkod, om SDK:n stöder fältet
+    gen_config_fields = getattr(genai.types.GenerateContentConfig, "model_fields", {})
+    if "store" in gen_config_fields:
+        config_kwargs["store"] = False
+
+    applied_thinking = "none (stöds ej av SDK)"
+    thinking_cls = getattr(genai.types, "ThinkingConfig", None)
+
+    if thinking_cls and thinking_level:
+        thinking_fields = getattr(thinking_cls, "model_fields", {})
+        if model_name.startswith("gemini-2.5"):
+            if "thinking_level" in thinking_fields:
+                config_kwargs["thinking_config"] = thinking_cls(thinking_level=thinking_level)
+                applied_thinking = thinking_level
+            elif "thinking_budget" in thinking_fields:
+                budget = 16384 if thinking_level == "high" else 4096
+                config_kwargs["thinking_config"] = thinking_cls(thinking_budget=budget)
+                applied_thinking = f"{thinking_level} (budget={budget})"
+        elif "thinking_level" in thinking_fields:
+            config_kwargs["thinking_config"] = thinking_cls(thinking_level=thinking_level)
+            applied_thinking = thinking_level
+
+    return genai.types.GenerateContentConfig(**config_kwargs), applied_thinking
+
+
+def classify_error(err: Exception) -> tuple[bool, str]:
+    """
+    Klassificerar fel i (är_övergående_för_fallback, sanerad_orsak).
+    Läcker aldrig råa felsträngar eller nyckeldata.
+    """
+    if isinstance(err, RunConfigError):
+        return False, str(err)
+
+    if isinstance(err, APIError):
+        code = getattr(err, "code", None)
+        label = SANITIZED_ERROR_LABELS.get(code, f"API-fel ({code or 'okänd kod'})")
+        return code in RETRYABLE_STATUS_CODES, label
+
+    if isinstance(err, httpx.TimeoutException):
+        return True, "nätverkstimeout"
+
+    if isinstance(err, (httpx.HTTPError, httpx.StreamError)):
+        return True, "tillfälligt nätverksfel"
+
+    return False, f"internt körningsfel ({type(err).__name__})"
+
+
+def validate_response(response) -> tuple[bool, str]:
+    """Kontrollerar att svaret har giltig kandidat, STOP-status och icke-tom text."""
+    candidates = getattr(response, "candidates", None)
+    if not candidates:
+        return False, "tom kandidatlista från modellen"
+
+    finish_reason = getattr(candidates[0], "finish_reason", None)
+    finish_str = str(finish_reason).upper() if finish_reason is not None else ""
+    if not finish_str.endswith("STOP"):
+        return False, f"ofullständigt avslut ({finish_str.split('.')[-1] or 'saknas'})"
+
+    text = (getattr(response, "text", None) or "").strip()
+    if not text:
+        return False, "tom modellrespons"
+
+    return True, ""
+
+
+def format_audit_block(
+    chosen_model: Optional[str],
+    requested_model: str,
+    thinking_desc: str,
+    fallback_used: bool,
+    fallback_reason: str,
+    role_source: str,
+) -> str:
+    """Skapar ett konsekvent revisionsblock för både lyckade och misslyckade körningar."""
+    lines = [
+        "### 🔎 Revisions- & Modellinformation",
+        f"- **Modell:** `{chosen_model or 'ingen (körning avbruten)'}`",
+        f"- **Begärd modell:** `{requested_model}`",
+        f"- **Resonemang:** `{thinking_desc}`",
+        f"- **Fallback:** `{'ja' if fallback_used else 'nej'}`",
+    ]
+    if fallback_reason:
+        lines.append(f"- **Orsak:** `{fallback_reason}`")
+    lines.append(f"- **Rollkälla:** `{role_source}`")
+    return "\n".join(lines)
+
+
+def _extract_sources(response) -> str:
+    try:
+        metadata = getattr(response.candidates[0], "grounding_metadata", None)
+        if not metadata:
+            return ""
+        links = []
+        for chunk in getattr(metadata, "grounding_chunks", None) or []:
+            web = getattr(chunk, "web", None)
+            if web and getattr(web, "uri", None) and getattr(web, "title", None):
+                links.append(f"- [{web.title}]({web.uri})")
+        if links:
+            return "\n\n### 🌐 Referenser & Källor (Google Search)\n" + "\n".join(sorted(set(links)))
+    except Exception:
+        pass
+    return ""
+
+
+def run_resilient_generation(
+    prompt: str,
+    system_instruction: str,
+    role_source: str = "default",
+    profile_name: str = "deep_investigation",
+    temperature: float = 0.1,
+) -> GenerationResult:
+    """
+    Kör modellförfrågan enligt vald profil med strikt felklassning,
+    svarvalidering och fullständig revisionsloggning. Kastar aldrig vid
+    API-/konfigurationsfel; returnerar istället en misslyckad GenerationResult.
+    """
+    profile = PROFILES.get(profile_name) or PROFILES["deep_investigation"]
+    requested_model = os.getenv("GEMINI_MODEL", "").strip() or profile.primary_model
+
+    def failure(reasons: list[str], thinking: str) -> GenerationResult:
+        return GenerationResult(
+            success=False,
+            text="",
+            sources_md="",
+            audit_md=format_audit_block(
+                chosen_model=None,
+                requested_model=requested_model,
+                thinking_desc=thinking,
+                fallback_used=False,
+                fallback_reason="; ".join(reasons),
+                role_source=role_source,
+            ),
+            chosen_model=None,
+            requested_model=requested_model,
+        )
+
+    try:
+        client = get_gemini_client()
+        candidate_models, requested_model = discover_candidate_models(client, profile_name=profile_name)
+    except Exception as init_err:
+        _, reason = classify_error(init_err)
+        return failure([reason], profile.thinking_level)
+
+    fallback_reasons: list[str] = []
+    chosen_model: Optional[str] = None
+    applied_thinking = profile.thinking_level
+    final_response = None
 
     for model_name in candidate_models:
-        print(f"Försöker anropa: {model_name}")
+        config, applied_thinking = build_generation_config(
+            model_name=model_name,
+            system_instruction=system_instruction,
+            temperature=temperature,
+            thinking_level=profile.thinking_level,
+        )
+
         delay = 5
+        abort_all = False
+
         for attempt in range(1, 4):
             try:
-                response = client.models.generate_content(
+                resp = client.models.generate_content(
                     model=model_name,
                     contents=prompt,
-                    config=config
+                    config=config,
                 )
-                chosen_model = model_name
-                break
-            except APIError as e:
-                print(f"API-fel för {model_name} ({e}) vid försök {attempt}/3.")
-                if getattr(e, "code", None) == 404 or "NOT_FOUND" in str(e):
+            except Exception as err:
+                is_retryable, sanitized_reason = classify_error(err)
+                if not is_retryable:
+                    fallback_reasons.append(f"{model_name}: {sanitized_reason}")
+                    abort_all = True
                     break
                 if attempt < 3:
                     time.sleep(delay)
                     delay *= 2
                 else:
-                    break
-            except (httpx.HTTPError, httpx.StreamError) as net_err:
-                print(f"Nätverksfel mot {model_name} ({net_err}) vid försök {attempt}/3.")
-                if attempt < 3:
-                    time.sleep(delay)
-                    delay *= 2
-                else:
-                    break
+                    fallback_reasons.append(f"{model_name}: {sanitized_reason}")
+                continue
 
-        if response is not None:
+            is_valid, invalid_reason = validate_response(resp)
+            if not is_valid:
+                # Ett ofullständigt svar blir inte bättre av omförsök; prova nästa tillåtna modell
+                fallback_reasons.append(f"{model_name}: {invalid_reason}")
+                break
+
+            final_response = resp
+            chosen_model = model_name
             break
 
-    if response is None:
-        raise RuntimeError("Samtliga anrop mot Gemini API misslyckades.")
+        if final_response is not None or abort_all:
+            break
 
-    # Extrahera källor från Google Search om tillgängligt
-    sources_md = ""
-    try:
-        if response.candidates:
-            candidate = response.candidates[0]
-            metadata = getattr(candidate, "grounding_metadata", None)
-            if metadata:
-                chunks = getattr(metadata, "grounding_chunks", [])
-                links = []
-                for chunk in chunks:
-                    web = getattr(chunk, "web", None)
-                    if web and getattr(web, "uri", None) and getattr(web, "title", None):
-                        links.append(f"- [{web.title}]({web.uri})")
-                if links:
-                    sources_md = "\n\n### 🌐 Referenser & Källor (Google Search)\n" + "\n".join(sorted(set(links)))
-    except Exception as meta_err:
-        print(f"Kunde inte tolka grounding metadata: {meta_err}")
+    if final_response is None:
+        return failure(fallback_reasons, applied_thinking)
 
-    return response.text, sources_md, chosen_model
+    return GenerationResult(
+        success=True,
+        text=final_response.text.strip(),
+        sources_md=_extract_sources(final_response),
+        audit_md=format_audit_block(
+            chosen_model=chosen_model,
+            requested_model=requested_model,
+            thinking_desc=applied_thinking,
+            fallback_used=chosen_model != requested_model,
+            fallback_reason="; ".join(fallback_reasons),
+            role_source=role_source,
+        ),
+        chosen_model=chosen_model,
+        requested_model=requested_model,
+    )

@@ -14,6 +14,7 @@ DEFAULT_ROLE = (
 )
 
 REPORT_HEADER = "## 📋 Gemini Utredningsrapport"
+STATUS_FAILURE_HEADER = "## ⚠️ Gemini Utredning – Körning avbruten"
 
 def main():
     issue_number = int(os.environ["ISSUE_NUMBER"])
@@ -64,20 +65,37 @@ def main():
 Vänligen leverera en utredningsrapport formaterad i ren Markdown.
 """
 
-    role = load_system_role(DEFAULT_ROLE)
-    report_text, sources, model_used = run_resilient_generation(prompt, role)
+    role_text, role_source = load_system_role(DEFAULT_ROLE)
+    print(f"Rollkälla: {role_source}")
+    result = run_resilient_generation(
+        prompt=prompt,
+        system_instruction=role_text,
+        role_source=role_source,
+        profile_name="deep_investigation",
+    )
+
+    if not result.success:
+        issue.create_comment(f"""{STATUS_FAILURE_HEADER}
+
+Utredningen kunde inte genomföras med godkänd analysmodell. Inget tekniskt resultat har genererats.
+
+{result.audit_md}
+""")
+        print("Körning avbruten; statusrapport postad.")
+        sys.exit(1)
 
     attached_summary = f"\n*Bifogade källkodsfiler: {len(attached_files)} st.*" if attached_files else ""
-    final_comment = f"""{REPORT_HEADER} ({model_used})
+    final_comment = f"""{REPORT_HEADER} ({result.chosen_model})
 
-{report_text}
-{sources}
+{result.text}
+{result.sources_md}
 
 ---
+{result.audit_md}
 *Automatiserad rapport genererad via Gemini API.{attached_summary}*"""
 
     issue.create_comment(final_comment)
-    print(f"Rapport postad med {model_used}.")
+    print(f"Rapport postad med {result.chosen_model}.")
 
 if __name__ == "__main__":
     main()

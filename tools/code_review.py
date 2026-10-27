@@ -12,6 +12,7 @@ DEFAULT_ROLE = (
 )
 
 REVIEW_HEADER = "## 🔍 Gemini Code Review"
+STATUS_FAILURE_HEADER = "## ⚠️ Gemini Code Review – Körning avbruten"
 
 def main():
     pr_number = int(os.environ["PR_NUMBER"])
@@ -63,19 +64,37 @@ def main():
 Vänligen leverera en strukturerad kodgranskningsrapport i ren Markdown.
 """
 
-    role = load_system_role(DEFAULT_ROLE)
-    report_text, sources, model_used = run_resilient_generation(prompt, role)
+    profile_name = os.getenv("GEMINI_PROFILE", "standard_review").strip() or "standard_review"
+    role_text, role_source = load_system_role(DEFAULT_ROLE)
+    print(f"Rollkälla: {role_source}")
+    result = run_resilient_generation(
+        prompt=prompt,
+        system_instruction=role_text,
+        role_source=role_source,
+        profile_name=profile_name,
+    )
 
-    final_comment = f"""{REVIEW_HEADER} ({model_used})
+    if not result.success:
+        pr.create_issue_comment(f"""{STATUS_FAILURE_HEADER}
 
-{report_text}
-{sources}
+Kodgranskningen kunde inte slutföras med godkänd modell. Inget tekniskt resultat har genererats.
+
+{result.audit_md}
+""")
+        print("Körning avbruten; statusrapport postad.")
+        sys.exit(1)
+
+    final_comment = f"""{REVIEW_HEADER} ({result.chosen_model})
+
+{result.text}
+{result.sources_md}
 
 ---
+{result.audit_md}
 *Automatiserad granskning genererad via Gemini API ({len(diff_entries)} filer analyserade).*"""
 
     pr.create_issue_comment(final_comment)
-    print(f"Granskning postad med {model_used}.")
+    print(f"Granskning postad med {result.chosen_model}.")
 
 if __name__ == "__main__":
     main()
