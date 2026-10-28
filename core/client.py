@@ -15,6 +15,7 @@ class ExecutionProfile:
     primary_model: str
     allowed_fallbacks: tuple[str, ...]
     thinking_level: str
+    grounding: bool = True
 
 
 PROFILES: dict[str, ExecutionProfile] = {
@@ -29,6 +30,7 @@ PROFILES: dict[str, ExecutionProfile] = {
         primary_model="gemini-3.8-flash",
         allowed_fallbacks=("gemini-3.1-pro-preview",),
         thinking_level="medium",
+        grounding=False,       # diff-granskning behöver sällan webbsökning; sparar sökavgifter
     ),
 }
 
@@ -302,7 +304,7 @@ def run_resilient_generation(
     profile = PROFILES.get(profile_name) or PROFILES["deep_investigation"]
     requested_model = os.getenv("GEMINI_MODEL", "").strip() or profile.primary_model
 
-    grounding_desc = "aktiv"
+    grounding_desc = "aktiv" if profile.grounding else "av (profil)"
 
     def failure(reasons: list[str], thinking: str) -> GenerationResult:
         return GenerationResult(
@@ -335,7 +337,7 @@ def run_resilient_generation(
     final_response = None
 
     for model_name in candidate_models:
-        grounding = True
+        grounding = profile.grounding
 
         def make_config():
             return build_generation_config(

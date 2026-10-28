@@ -202,3 +202,29 @@ def test_store_is_opt_in(monkeypatch):
     monkeypatch.delenv("GEMINI_OPT_OUT_STORAGE", raising=False)
     cfg, _ = c.build_generation_config("gemini-4-argon", "s", 0.1, "high")
     assert getattr(cfg, "store", None) is None
+
+
+def test_standard_review_never_sends_google_search(monkeypatch):
+    class Models(FakeModels):
+        def generate_content(self, model, contents, config):
+            self.calls.append(bool(getattr(config, "tools", None)))
+            return ok_response()
+
+    fake = install(monkeypatch, list(c.ALL_APPROVED_MODELS), {})
+    fake.models = Models(list(c.ALL_APPROVED_MODELS), {})
+    result = run("standard_review")
+    assert result.success and fake.models.calls == [False]
+    assert "Grounding:** `av (profil)`" in result.audit_md
+
+
+def test_deep_investigation_keeps_grounding(monkeypatch):
+    class Models(FakeModels):
+        def generate_content(self, model, contents, config):
+            self.calls.append(bool(getattr(config, "tools", None)))
+            return ok_response()
+
+    fake = install(monkeypatch, list(c.ALL_APPROVED_MODELS), {})
+    fake.models = Models(list(c.ALL_APPROVED_MODELS), {})
+    result = run("deep_investigation")
+    assert result.success and fake.models.calls == [True]
+    assert "Grounding:** `aktiv`" in result.audit_md
