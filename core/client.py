@@ -1,3 +1,4 @@
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -6,6 +7,7 @@ from typing import Optional
 from github import Github
 from google import genai
 from google.genai.errors import APIError
+from google.oauth2 import service_account
 import httpx
 
 
@@ -15,7 +17,7 @@ class ExecutionProfile:
     primary_model: str
     allowed_fallbacks: tuple[str, ...]
     thinking_level: str
-    grounding: bool = True
+    enable_grounding: bool = True     # Google Search kostar per sökning; kan överstyras med GEMINI_ENABLE_GROUNDING
 
 
 PROFILES: dict[str, ExecutionProfile] = {
@@ -24,13 +26,14 @@ PROFILES: dict[str, ExecutionProfile] = {
         primary_model="gemini-4-argon",
         allowed_fallbacks=("gemini-3.1-pro-preview", "gemini-2.5-pro"),
         thinking_level="high",
+        enable_grounding=True,
     ),
     "standard_review": ExecutionProfile(
         name="standard_review",
         primary_model="gemini-3.8-flash",
         allowed_fallbacks=("gemini-3.1-pro-preview",),
         thinking_level="medium",
-        grounding=False,       # diff-granskning behöver sällan webbsökning; sparar sökavgifter
+        enable_grounding=False,  # granskning av lokal diff behöver ingen betald webbsökning
     ),
 }
 
@@ -102,19 +105,66 @@ def load_system_role(default_role: str) -> tuple[str, str]:
     return default_role, "default"
 
 
+VERTEX_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
+
+
+def _vertex_location() -> str:
+    # Nya preview-/3.x/4.x-modeller exponeras ofta på den globala endpointen i Vertex AI.
+    return os.getenv("GOOGLE_CLOUD_LOCATION", "").strip() or "global"
+
+
+def active_platform() -> str:
+    """Plattform för revisionsblocket, enligt samma regel som get_gemini_client()."""
+    if os.environ.get("GCP_SA_KEY", "").strip():
+        return f"Vertex AI ({_vertex_location()})"
+    return "AI Studio"
+
+
 def get_gemini_client() -> genai.Client:
-    """Initierar Google GenAI-klienten."""
+    """Initierar Google GenAI-klienten.
+
+    Primärt Vertex AI med ett Service Account i GCP_SA_KEY (rå JSON). Annars AI Studio med
+    GEMINI_API_KEY. Felmeddelanden innehåller aldrig nyckelns innehåll."""
+    raw = os.environ.get("GCP_SA_KEY", "").strip()
+    if raw:
+        try:
+            info = json.loads(raw)
+        except (ValueError, TypeError):
+            raise RunConfigError("GCP_SA_KEY är inte giltig JSON") from None
+        if not isinstance(info, dict):
+            raise RunConfigError("GCP_SA_KEY är inte ett JSON-objekt")
+        project = os.getenv("GOOGLE_CLOUD_PROJECT", "").strip() or info.get("project_id")
+        if not project:
+            raise RunConfigError("projekt saknas i GCP_SA_KEY och GOOGLE_CLOUD_PROJECT")
+        try:
+            credentials = service_account.Credentials.from_service_account_info(info, scopes=VERTEX_SCOPES)
+        except Exception:
+            raise RunConfigError("GCP_SA_KEY kunde inte användas som service account") from None
+        return genai.Client(vertexai=True, project=project, location=_vertex_location(),
+                            credentials=credentials)
+
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
-        raise RunConfigError("GEMINI_API_KEY saknas")
+        raise RunConfigError("varken GCP_SA_KEY eller GEMINI_API_KEY finns")
     return genai.Client(api_key=key)
+
+
+def grounding_enabled(profile: "ExecutionProfile") -> tuple[bool, str]:
+    """(påslaget, beskrivning). GEMINI_ENABLE_GROUNDING=true/false överstyr profilen."""
+    override = os.getenv("GEMINI_ENABLE_GROUNDING", "").strip().lower()
+    if override in ("true", "false"):
+        on = override == "true"
+        return on, ("aktiv" if on else "av") + " (GEMINI_ENABLE_GROUNDING)"
+    return profile.enable_grounding, "aktiv" if profile.enable_grounding else "av (profil)"
 
 
 def fetch_available_models(client: genai.Client) -> set[str]:
     """Hämtar alla modeller på kontot som stöder generateContent."""
     available = set()
     for model in client.models.list():
-        name = (model.name or "").removeprefix("models/")
+        # AI Studio: "models/<namn>"; Vertex AI: "publishers/google/models/<namn>" eller
+        # "projects/.../models/<namn>". Sista ledet matchas mot ALL_APPROVED_MODELS.
+        name = (model.name or "").split("/")[-1]
         actions = (
             getattr(model, "supported_actions", None)
             or getattr(model, "supported_generation_methods", None)
@@ -256,6 +306,7 @@ def format_audit_block(
     fallback_reason: str,
     role_source: str,
     grounding_desc: str = "aktiv",
+    platform: str = "AI Studio",
 ) -> str:
     """Skapar ett konsekvent revisionsblock för både lyckade och misslyckade körningar."""
     lines = [
@@ -268,6 +319,7 @@ def format_audit_block(
     if fallback_reason:
         lines.append(f"- **Orsak:** `{fallback_reason}`")
     lines.append(f"- **Grounding:** `{grounding_desc}`")
+    lines.append(f"- **Plattform:** `{platform}`")
     lines.append(f"- **Rollkälla:** `{role_source}`")
     return "\n".join(lines)
 
@@ -304,7 +356,8 @@ def run_resilient_generation(
     profile = PROFILES.get(profile_name) or PROFILES["deep_investigation"]
     requested_model = os.getenv("GEMINI_MODEL", "").strip() or profile.primary_model
 
-    grounding_desc = "aktiv" if profile.grounding else "av (profil)"
+    profile_grounding, grounding_desc = grounding_enabled(profile)
+    platform = active_platform()
 
     def failure(reasons: list[str], thinking: str) -> GenerationResult:
         return GenerationResult(
@@ -319,6 +372,7 @@ def run_resilient_generation(
                 fallback_reason="; ".join(reasons),
                 role_source=role_source,
                 grounding_desc=grounding_desc,
+                platform=platform,
             ),
             chosen_model=None,
             requested_model=requested_model,
@@ -337,7 +391,7 @@ def run_resilient_generation(
     final_response = None
 
     for model_name in candidate_models:
-        grounding = profile.grounding
+        grounding = profile_grounding
 
         def make_config():
             return build_generation_config(
@@ -418,6 +472,7 @@ def run_resilient_generation(
             fallback_reason="; ".join(fallback_reasons),
             role_source=role_source,
             grounding_desc=grounding_desc,
+            platform=platform,
         ),
         chosen_model=chosen_model,
         requested_model=requested_model,

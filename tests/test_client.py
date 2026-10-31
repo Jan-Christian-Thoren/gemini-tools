@@ -46,6 +46,8 @@ def api_error(code):
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
     monkeypatch.delenv("GEMINI_MODEL", raising=False)
+    for v in ("GCP_SA_KEY", "GOOGLE_CLOUD_PROJECT", "GOOGLE_CLOUD_LOCATION", "GEMINI_ENABLE_GROUNDING"):
+        monkeypatch.delenv(v, raising=False)
     monkeypatch.setattr(c.time, "sleep", lambda s: None)
 
 
@@ -228,3 +230,98 @@ def test_deep_investigation_keeps_grounding(monkeypatch):
     result = run("deep_investigation")
     assert result.success and fake.models.calls == [True]
     assert "Grounding:** `aktiv`" in result.audit_md
+
+
+# --- Vertex AI -----------------------------------------------------------------------------------
+
+SA_JSON = '{"type": "service_account", "project_id": "proj-from-key", "client_email": "x@y", "private_key": "SECRET"}'
+
+
+def _capture_vertex(monkeypatch):
+    seen = {}
+
+    def fake_creds(info, scopes=None):
+        seen["info"], seen["scopes"] = info, scopes
+        return "CREDS"
+
+    class FakeGenaiClient:
+        def __init__(self, **kw):
+            seen["client_kwargs"] = kw
+
+    monkeypatch.setattr(c.service_account.Credentials, "from_service_account_info", staticmethod(fake_creds))
+    monkeypatch.setattr(c.genai, "Client", FakeGenaiClient)
+    return seen
+
+
+def test_vertex_client_from_service_account(monkeypatch):
+    seen = _capture_vertex(monkeypatch)
+    monkeypatch.setenv("GCP_SA_KEY", SA_JSON)
+    monkeypatch.setenv("GEMINI_API_KEY", "should-not-be-used")
+    c.get_gemini_client()
+    assert seen["scopes"] == ["https://www.googleapis.com/auth/cloud-platform"]
+    assert seen["client_kwargs"] == {"vertexai": True, "project": "proj-from-key", "location": "global",
+                                     "credentials": "CREDS"}
+    assert c.active_platform() == "Vertex AI (global)"
+
+
+def test_vertex_project_and_location_overrides(monkeypatch):
+    seen = _capture_vertex(monkeypatch)
+    monkeypatch.setenv("GCP_SA_KEY", SA_JSON)
+    monkeypatch.setenv("GOOGLE_CLOUD_PROJECT", "proj-override")
+    monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "europe-west1")
+    c.get_gemini_client()
+    assert (seen["client_kwargs"]["project"], seen["client_kwargs"]["location"]) == ("proj-override", "europe-west1")
+
+
+def test_invalid_service_account_key_never_leaks(monkeypatch):
+    _capture_vertex(monkeypatch)
+    monkeypatch.setenv("GCP_SA_KEY", '{"private_key": "SECRET"')          # broken JSON
+    result = c.run_resilient_generation("p", "sys")
+    assert not result.success
+    assert "SECRET" not in result.audit_md
+    assert "GCP_SA_KEY" in result.audit_md
+    assert "Vertex AI" in result.audit_md
+
+
+def test_ai_studio_fallback_without_service_account(monkeypatch):
+    seen = _capture_vertex(monkeypatch)
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    c.get_gemini_client()
+    assert seen["client_kwargs"] == {"api_key": "k"}
+    assert c.active_platform() == "AI Studio"
+
+
+def test_vertex_model_names_are_normalised(monkeypatch):
+    class M:
+        def __init__(self, name):
+            self.name, self.supported_actions = name, None
+
+    class L:
+        class models:
+            @staticmethod
+            def list():
+                return [M("publishers/google/models/gemini-3.1-pro-preview"),
+                        M("projects/p/locations/global/models/gemini-4-argon"),
+                        M("models/gemini-2.5-pro")]
+    assert c.fetch_available_models(L()) == {"gemini-3.1-pro-preview", "gemini-4-argon", "gemini-2.5-pro"}
+
+
+def test_standard_review_has_no_search_by_default():
+    assert c.PROFILES["standard_review"].enable_grounding is False
+    assert c.PROFILES["deep_investigation"].enable_grounding is True
+    on, desc = c.grounding_enabled(c.PROFILES["standard_review"])
+    assert (on, desc) == (False, "av (profil)")
+
+
+def test_grounding_override_by_env(monkeypatch):
+    monkeypatch.setenv("GEMINI_ENABLE_GROUNDING", "true")
+    assert c.grounding_enabled(c.PROFILES["standard_review"]) == (True, "aktiv (GEMINI_ENABLE_GROUNDING)")
+    monkeypatch.setenv("GEMINI_ENABLE_GROUNDING", "false")
+    assert c.grounding_enabled(c.PROFILES["deep_investigation"]) == (False, "av (GEMINI_ENABLE_GROUNDING)")
+
+
+def test_audit_shows_platform(monkeypatch):
+    install(monkeypatch, list(c.ALL_APPROVED_MODELS), {m: ok_response() for m in c.ALL_APPROVED_MODELS})
+    monkeypatch.setenv("GCP_SA_KEY", SA_JSON)
+    monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "europe-west1")
+    assert "Plattform:** `Vertex AI (europe-west1)`" in run().audit_md
