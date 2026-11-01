@@ -66,8 +66,8 @@ def select_tier(cfg: dict, event_name: str, event: dict) -> TierChoice:
         author = (comment.get("user") or {}).get("login", "")
         if comment.get("author_association") not in cfg.get("command_associations", []):
             return TierChoice(None, "kommando", denied="kommandot får bara användas av repots medlemmar")
-        if tier == "djup" and author != cfg["owner"]:
-            return TierChoice(None, "kommando", denied="djup via kommando kräver repo-ägaren")
+        if tier == "djup" and author.lower() not in {u.lower() for u in cfg.get("djup_command_users") or []}:
+            return TierChoice(None, "kommando", denied="djup via kommando kräver repo-ägaren (djup_command_users)")
         return TierChoice(tier, "kommando", extra)
 
     ai = [l.split(":", 1)[1] for l in _labels(item) if l.startswith("ai:") and l.split(":", 1)[1] in TIER_NAMES]

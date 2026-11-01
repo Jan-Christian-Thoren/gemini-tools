@@ -5,7 +5,7 @@ import pytest
 from core import tiers
 
 CFG = tiers.load_config()
-OWNER = CFG["owner"]
+OWNER = CFG["djup_command_users"][0]
 
 
 def comment(body, login=OWNER, assoc="OWNER"):
@@ -48,6 +48,14 @@ def test_djup_command_only_for_owner():
     ch = tiers.select_tier(CFG, "issue_comment", comment("/gemini djup analysera", login="someone", assoc="COLLABORATOR"))
     assert ch.tier is None and "ägaren" in ch.denied
     assert tiers.select_tier(CFG, "issue_comment", comment("/gemini djup analysera")).tier == "djup"
+
+
+def test_djup_command_works_for_org_member_listed_in_config():
+    # i ett org-repo är ägarens personkonto MEMBER, aldrig OWNER, och org-namnet kommenterar aldrig
+    ch = tiers.select_tier(CFG, "issue_comment", comment("/gemini djup x", login=OWNER, assoc="MEMBER"))
+    assert ch.tier == "djup"
+    ch = tiers.select_tier(CFG, "issue_comment", comment("/gemini djup x", login=CFG["owner"], assoc="MEMBER"))
+    assert ch.tier is None or CFG["owner"] in CFG["djup_command_users"]
 
 
 def test_command_requires_repo_member():

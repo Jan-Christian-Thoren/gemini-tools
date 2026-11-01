@@ -2,13 +2,14 @@
 # resonemang, gränser och priser anges). Workflows hårdkodar aldrig modell-ID:n.
 #
 # Val av nivå, i prioritetsordning:
-#   1. Kommentarkommando  /gemini snabb|standard|djup [fri fråga]   (djup bara för owner)
+#   1. Kommentarkommando  /gemini snabb|standard|djup [fri fråga]   (djup bara för djup_command_users)
 #   2. Label              ai:snabb | ai:standard | ai:djup
 #   3. Default            snabb
 # Ingen nivå eskalerar automatiskt: modellreserven inom en nivå går bara till samma eller
 # billigare modell.
 
-owner: Jan-Christian-Thoren
+owner: Jan-Christian-Thoren          # GitHub-organisationen; kan inte själv skriva kommentarer
+djup_command_users: [jthoren69]     # personkonton som får köra /gemini djup (Jans konto)
 default_tier: snabb
 command_associations: [OWNER, MEMBER, COLLABORATOR]   # vilka som får använda /gemini
 max_input_bytes: 200000          # större diff eller bilagor trunkeras och det står i rapporten

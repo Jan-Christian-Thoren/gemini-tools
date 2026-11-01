@@ -14,7 +14,7 @@ Alla anrop körs på en av tre nivåer. Modeller, resonemang, utdatagränser, ti
 
 **Så väljs nivån** (högst prioritet först):
 
-1. **Kommentar** i PR:en eller issuet: `/gemini snabb|standard|djup [fri fråga]`. Den fria texten skickas med som extra fråga. Kommandot får användas av repots medlemmar; `djup` bara av repo-ägaren.
+1. **Kommentar** i PR:en eller issuet: `/gemini snabb|standard|djup [fri fråga]`. Den fria texten skickas med som extra fråga. Kommandot får användas av repots medlemmar; `djup` bara av kontona i `djup_command_users` (ägarens personkonto; organisationen själv kan inte kommentera).
 2. **Label:** `ai:snabb`, `ai:standard` eller `ai:djup`. Att sätta labeln startar en körning. Har en PR flera ai-labels gäller den billigaste.
 3. **Default:** `snabb`.
 
