@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -274,6 +275,16 @@ def build_generation_config(
     return genai.types.GenerateContentConfig(**config_kwargs), applied_thinking
 
 
+def api_error_detail(err: Exception, limit: int = 200) -> str:
+    """API:ts egen status och felmeddelande för loggen (aldrig för GitHub-kommentarer).
+    Meddelandet kapas och rensas från sådant som kan likna nycklar eller tokens."""
+    if not isinstance(err, APIError):
+        return type(err).__name__
+    msg = " ".join(str(getattr(err, "message", "") or "").split())
+    msg = re.sub(r"(AIza[0-9A-Za-z_\-]{10,}|ya29\.[0-9A-Za-z_\-\.]+|-----BEGIN[^-]*-----)", "[borttaget]", msg)
+    return f"{getattr(err, 'code', '?')} {getattr(err, 'status', '') or ''}: {msg}"[:limit]
+
+
 def error_code(err: Exception) -> Optional[int]:
     return getattr(err, "code", None) if isinstance(err, APIError) else None
 
@@ -499,7 +510,8 @@ def run_resilient_generation(
                 )
                 log(f"svar från {model_name} efter {int(time.monotonic() - t0)} s")
             except Exception as err:
-                log(f"fel från {model_name} efter {int(time.monotonic() - t0)} s: {classify_error(err)[1]}")
+                log(f"fel från {model_name} efter {int(time.monotonic() - t0)} s: {classify_error(err)[1]}"
+                    f" | API: {api_error_detail(err)}")
                 done.set()
                 code = error_code(err)
                 _, sanitized_reason = classify_error(err)
