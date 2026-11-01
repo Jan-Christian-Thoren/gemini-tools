@@ -1,5 +1,7 @@
 import json
 import os
+import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,6 +12,8 @@ from google.genai.errors import APIError
 from google.oauth2 import service_account
 import httpx
 
+from core import tiers
+
 
 @dataclass(frozen=True)
 class ExecutionProfile:
@@ -18,24 +22,25 @@ class ExecutionProfile:
     allowed_fallbacks: tuple[str, ...]
     thinking_level: str
     enable_grounding: bool = True     # Google Search kostar per sökning; kan överstyras med GEMINI_ENABLE_GROUNDING
+    max_output_tokens: Optional[int] = None
+    request_timeout_s: Optional[int] = None
+    run_budget_s: Optional[int] = None
 
 
-PROFILES: dict[str, ExecutionProfile] = {
-    "deep_investigation": ExecutionProfile(
-        name="deep_investigation",
-        primary_model="gemini-4-argon",
-        allowed_fallbacks=("gemini-3.1-pro-preview", "gemini-2.5-pro"),
-        thinking_level="high",
-        enable_grounding=True,
-    ),
-    "standard_review": ExecutionProfile(
-        name="standard_review",
-        primary_model="gemini-3.8-flash",
-        allowed_fallbacks=("gemini-3.1-pro-preview",),
-        thinking_level="medium",
-        enable_grounding=False,  # granskning av lokal diff behöver ingen betald webbsökning
-    ),
-}
+def _profiles_from_tiers() -> dict[str, ExecutionProfile]:
+    """Nivåerna i config/gemini-tiers.yml är de enda profilerna; gamla namn är alias."""
+    cfg = tiers.load_config()
+    out = {}
+    for name in list(cfg["tiers"]) + list(cfg.get("aliases", {})):
+        t = tiers.get_tier(cfg, name)
+        out[name] = ExecutionProfile(name=t.name, primary_model=t.models[0], allowed_fallbacks=t.models[1:],
+                                     thinking_level=t.thinking_level, enable_grounding=t.grounding,
+                                     max_output_tokens=t.max_output_tokens,
+                                     request_timeout_s=t.request_timeout_s, run_budget_s=t.run_budget_s)
+    return out
+
+
+PROFILES: dict[str, ExecutionProfile] = _profiles_from_tiers()
 
 ALL_APPROVED_MODELS = {
     "gemini-4-argon",
@@ -71,6 +76,8 @@ class GenerationResult:
     audit_md: str
     chosen_model: Optional[str]
     requested_model: str
+    usage: Optional[dict] = None          # {"input", "output", "thinking"} från usage_metadata
+    truncated: bool = False
 
 
 def get_github_context():
@@ -120,7 +127,17 @@ def active_platform() -> str:
     return "AI Studio"
 
 
-def get_gemini_client() -> genai.Client:
+def log(msg: str):
+    """Löpande rad i Actions-loggen (aldrig nyckelinnehåll), skrivs direkt."""
+    print(f"[gemini {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    sys.stdout.flush()
+
+
+def _http_options(timeout_s: Optional[int]) -> dict:
+    return {"http_options": genai.types.HttpOptions(timeout=int(timeout_s * 1000))} if timeout_s else {}
+
+
+def get_gemini_client(timeout_s: Optional[int] = None) -> genai.Client:
     """Initierar Google GenAI-klienten.
 
     Primärt Vertex AI med ett Service Account i GCP_SA_KEY (rå JSON). Annars AI Studio med
@@ -141,12 +158,12 @@ def get_gemini_client() -> genai.Client:
         except Exception:
             raise RunConfigError("GCP_SA_KEY kunde inte användas som service account") from None
         return genai.Client(vertexai=True, project=project, location=_vertex_location(),
-                            credentials=credentials)
+                            credentials=credentials, **_http_options(timeout_s))
 
     key = os.environ.get("GEMINI_API_KEY")
     if not key:
         raise RunConfigError("varken GCP_SA_KEY eller GEMINI_API_KEY finns")
-    return genai.Client(api_key=key)
+    return genai.Client(api_key=key, **_http_options(timeout_s))
 
 
 def grounding_enabled(profile: "ExecutionProfile") -> tuple[bool, str]:
@@ -217,6 +234,7 @@ def build_generation_config(
     temperature: float,
     thinking_level: str,
     grounding: bool = True,
+    max_output_tokens: Optional[int] = None,
 ) -> tuple[genai.types.GenerateContentConfig, str]:
     """
     Bygger GenerateContentConfig anpassad efter modellfamilj och installerad SDK-version.
@@ -228,6 +246,8 @@ def build_generation_config(
     }
     if grounding:
         config_kwargs["tools"] = [{"google_search": {}}]
+    if max_output_tokens:
+        config_kwargs["max_output_tokens"] = int(max_output_tokens)
 
     # store=False är opt-in (GEMINI_OPT_OUT_STORAGE=true) och sätts bara om SDK:n har fältet
     gen_config_fields = getattr(genai.types.GenerateContentConfig, "model_fields", {})
@@ -288,14 +308,28 @@ def validate_response(response) -> tuple[bool, str]:
 
     finish_reason = getattr(candidates[0], "finish_reason", None)
     finish_str = str(finish_reason).upper() if finish_reason is not None else ""
+    text = (getattr(response, "text", None) or "").strip()
+    # Nivåns utdatagräns: ett avkapat men icke-tomt svar används och märks som trunkerat.
+    if finish_str.endswith("MAX_TOKENS") and text:
+        return True, "MAX_TOKENS"
     if not finish_str.endswith("STOP"):
         return False, f"ofullständigt avslut ({finish_str.split('.')[-1] or 'saknas'})"
 
-    text = (getattr(response, "text", None) or "").strip()
     if not text:
         return False, "tom modellrespons"
 
     return True, ""
+
+
+def extract_usage(response) -> Optional[dict]:
+    meta = getattr(response, "usage_metadata", None)
+    if meta is None:
+        return None
+    def n(field):
+        v = getattr(meta, field, None)
+        return int(v) if isinstance(v, (int, float)) else 0
+    return {"input": n("prompt_token_count") + n("tool_use_prompt_token_count"),
+            "output": n("candidates_token_count"), "thinking": n("thoughts_token_count")}
 
 
 def format_audit_block(
@@ -307,6 +341,11 @@ def format_audit_block(
     role_source: str,
     grounding_desc: str = "aktiv",
     platform: str = "AI Studio",
+    tier_desc: Optional[str] = None,
+    usage: Optional[dict] = None,
+    cost_sek: Optional[float] = None,
+    available: Optional[list] = None,
+    truncated: bool = False,
 ) -> str:
     """Skapar ett konsekvent revisionsblock för både lyckade och misslyckade körningar."""
     lines = [
@@ -320,6 +359,16 @@ def format_audit_block(
         lines.append(f"- **Orsak:** `{fallback_reason}`")
     lines.append(f"- **Grounding:** `{grounding_desc}`")
     lines.append(f"- **Plattform:** `{platform}`")
+    if tier_desc:
+        lines.append(f"{tiers.LEVEL_MARKER}{tier_desc}`")
+    if usage is not None:
+        lines.append(f"- **Tokens:** in {usage['input']} · ut {usage['output']} · varav thinking {usage['thinking']}"
+                     + (" · svaret trunkerat vid nivåns gräns" if truncated else ""))
+        lines.append("- **Uppskattad kostnad:** "
+                     + (f"`{cost_sek:.2f} kr` (uppskattning från pristabellen i gemini-tiers.yml)"
+                        if cost_sek is not None else "`okänd` (modell saknas i pristabellen)"))
+    if available is not None:
+        lines.append(f"- **Godkända modeller hos plattformen:** `{', '.join(sorted(available)) or 'inga'}`")
     lines.append(f"- **Rollkälla:** `{role_source}`")
     return "\n".join(lines)
 
@@ -347,6 +396,7 @@ def run_resilient_generation(
     role_source: str = "default",
     profile_name: str = "deep_investigation",
     temperature: float = 0.1,
+    tier_source: str = "default",
 ) -> GenerationResult:
     """
     Kör modellförfrågan enligt vald profil med strikt felklassning,
@@ -358,6 +408,9 @@ def run_resilient_generation(
 
     profile_grounding, grounding_desc = grounding_enabled(profile)
     platform = active_platform()
+    cfg = tiers.load_config()
+    tier_desc = f"{profile.name} ({tier_source})"
+    available_approved: Optional[list] = None
 
     def failure(reasons: list[str], thinking: str) -> GenerationResult:
         return GenerationResult(
@@ -373,19 +426,32 @@ def run_resilient_generation(
                 role_source=role_source,
                 grounding_desc=grounding_desc,
                 platform=platform,
+                tier_desc=tier_desc,
+                available=available_approved,
             ),
             chosen_model=None,
             requested_model=requested_model,
         )
 
+    started = time.monotonic()
+    budget = profile.run_budget_s
+    heartbeat_s = int(cfg.get("heartbeat_s", 60))
+    log(f"start: nivå {tier_desc}, plattform {platform}, tidsgräns per anrop "
+        f"{profile.request_timeout_s or 'ingen'} s, budget {budget or 'ingen'} s")
     try:
-        client = get_gemini_client()
+        client = get_gemini_client(timeout_s=profile.request_timeout_s)
+        try:
+            available_approved = sorted(fetch_available_models(client) & ALL_APPROVED_MODELS)
+            log(f"godkända modeller hos plattformen: {', '.join(available_approved) or 'inga'}")
+        except Exception:
+            available_approved = None
         candidate_models, requested_model = discover_candidate_models(client, profile_name=profile_name)
     except Exception as init_err:
         _, reason = classify_error(init_err)
         return failure([reason], profile.thinking_level)
 
     fallback_reasons: list[str] = []
+    truncated = False
     chosen_model: Optional[str] = None
     applied_thinking = profile.thinking_level
     final_response = None
@@ -400,6 +466,7 @@ def run_resilient_generation(
                 temperature=temperature,
                 thinking_level=profile.thinking_level,
                 grounding=grounding,
+                max_output_tokens=profile.max_output_tokens,
             )
 
         config, applied_thinking = make_config()
@@ -410,13 +477,30 @@ def run_resilient_generation(
 
         while attempt < 3:
             attempt += 1
+            elapsed = time.monotonic() - started
+            if budget and elapsed + (profile.request_timeout_s or 0) > budget:
+                fallback_reasons.append(f"{model_name}: tidsbudget {budget} s räcker inte för ett nytt anrop")
+                log(f"stopp: {int(elapsed)} s använt, budgeten {budget} s räcker inte för ett nytt anrop")
+                abort_all = True
+                break
+            log(f"anrop {attempt}/3 till {model_name} (grounding {'på' if grounding else 'av'})")
+            t0 = time.monotonic()
+            done = threading.Event()
+
+            def heartbeat(model=model_name, t_start=t0):
+                while not done.wait(heartbeat_s):
+                    log(f"väntar på svar från {model}: {int(time.monotonic() - t_start)} s")
+            threading.Thread(target=heartbeat, daemon=True).start()
             try:
                 resp = client.models.generate_content(
                     model=model_name,
                     contents=prompt,
                     config=config,
                 )
+                log(f"svar från {model_name} efter {int(time.monotonic() - t0)} s")
             except Exception as err:
+                log(f"fel från {model_name} efter {int(time.monotonic() - t0)} s: {classify_error(err)[1]}")
+                done.set()
                 code = error_code(err)
                 _, sanitized_reason = classify_error(err)
 
@@ -444,6 +528,7 @@ def run_resilient_generation(
                     fallback_reasons.append(f"{model_name}: {sanitized_reason}")
                 continue
 
+            done.set()
             is_valid, invalid_reason = validate_response(resp)
             if not is_valid:
                 # Ett ofullständigt svar blir inte bättre av omförsök; prova nästa tillåtna modell
@@ -452,13 +537,19 @@ def run_resilient_generation(
 
             final_response = resp
             chosen_model = model_name
+            truncated = invalid_reason == "MAX_TOKENS"
             break
 
         if final_response is not None or abort_all:
             break
 
     if final_response is None:
+        log(f"klart utan resultat efter {int(time.monotonic() - started)} s: {'; '.join(fallback_reasons)}")
         return failure(fallback_reasons, applied_thinking)
+    log(f"klart med {chosen_model} efter {int(time.monotonic() - started)} s")
+
+    usage = extract_usage(final_response)
+    cost = tiers.estimate_cost_sek(cfg, chosen_model, usage) if usage else None
 
     return GenerationResult(
         success=True,
@@ -473,7 +564,14 @@ def run_resilient_generation(
             role_source=role_source,
             grounding_desc=grounding_desc,
             platform=platform,
+            tier_desc=tier_desc,
+            usage=usage or {"input": 0, "output": 0, "thinking": 0},
+            cost_sek=cost,
+            available=available_approved,
+            truncated=truncated,
         ),
         chosen_model=chosen_model,
         requested_model=requested_model,
+        usage=usage,
+        truncated=truncated,
     )

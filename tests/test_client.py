@@ -53,7 +53,7 @@ def _env(monkeypatch):
 
 def install(monkeypatch, names, outcomes):
     fake = FakeClient(names, outcomes)
-    monkeypatch.setattr(c, "get_gemini_client", lambda: fake)
+    monkeypatch.setattr(c, "get_gemini_client", lambda **kw: fake)
     return fake
 
 
@@ -122,7 +122,7 @@ def test_network_error_is_retryable():
     "resp",
     [
         SimpleNamespace(text="x", candidates=[]),
-        ok_response(finish="MAX_TOKENS"),
+        ok_response(text="  ", finish="MAX_TOKENS"),
         ok_response(finish="SAFETY"),
         ok_response(text="   "),
     ],
@@ -325,3 +325,51 @@ def test_audit_shows_platform(monkeypatch):
     monkeypatch.setenv("GCP_SA_KEY", SA_JSON)
     monkeypatch.setenv("GOOGLE_CLOUD_LOCATION", "europe-west1")
     assert "Plattform:** `Vertex AI (europe-west1)`" in run().audit_md
+
+
+def test_max_tokens_with_text_is_accepted_as_truncated():
+    assert c.validate_response(ok_response(finish="MAX_TOKENS")) == (True, "MAX_TOKENS")
+
+
+def test_tier_limits_reach_the_config():
+    cfg, _ = c.build_generation_config("gemini-3.8-flash", "s", 0.1, "minimal", grounding=False, max_output_tokens=2000)
+    assert cfg.max_output_tokens == 2000
+    assert c.PROFILES["snabb"].max_output_tokens == 2000
+    assert c.PROFILES["djup"].primary_model == "gemini-4-argon"
+    assert "flash" not in " ".join(c.PROFILES["djup"].allowed_fallbacks)
+
+
+def test_audit_reports_tier_tokens_and_cost(monkeypatch):
+    resp = ok_response()
+    resp.usage_metadata = SimpleNamespace(prompt_token_count=1000, candidates_token_count=500,
+                                          thoughts_token_count=1500, tool_use_prompt_token_count=0)
+    install(monkeypatch, list(c.ALL_APPROVED_MODELS), {m: resp for m in c.ALL_APPROVED_MODELS})
+    r = c.run_resilient_generation("p", "sys", profile_name="snabb", tier_source="label")
+    assert "Nivå:** `snabb (label)`" in r.audit_md
+    assert "Tokens:** in 1000 · ut 500 · varav thinking 1500" in r.audit_md
+    assert "Uppskattad kostnad:** `" in r.audit_md and "uppskattning" in r.audit_md
+    assert r.usage == {"input": 1000, "output": 500, "thinking": 1500}
+
+
+def test_request_timeout_reaches_the_client(monkeypatch):
+    seen = _capture_vertex(monkeypatch)
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    c.get_gemini_client(timeout_s=180)
+    assert seen["client_kwargs"]["http_options"].timeout == 180000
+
+
+def test_run_budget_stops_before_the_job_timeout(monkeypatch):
+    install(monkeypatch, list(c.ALL_APPROVED_MODELS), {m: api_error(503) for m in c.ALL_APPROVED_MODELS})
+    clock = {"t": 0.0}
+    monkeypatch.setattr(c.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(c.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + 200))
+    r = c.run_resilient_generation("p", "sys", profile_name="snabb")
+    assert not r.success
+    assert "tidsbudget" in r.audit_md
+
+
+def test_progress_is_logged(monkeypatch, capsys):
+    install(monkeypatch, list(c.ALL_APPROVED_MODELS), {m: ok_response() for m in c.ALL_APPROVED_MODELS})
+    c.run_resilient_generation("p", "sys", profile_name="snabb")
+    out = capsys.readouterr().out
+    assert "start: nivå snabb" in out and "anrop 1/3 till gemini-3.8-flash" in out and "klart med" in out

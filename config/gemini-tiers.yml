@@ -1,0 +1,66 @@
+# Nivåstyrd modell- och ambitionsnivå för alla Gemini-anrop (det enda stället där modeller,
+# resonemang, gränser och priser anges). Workflows hårdkodar aldrig modell-ID:n.
+#
+# Val av nivå, i prioritetsordning:
+#   1. Kommentarkommando  /gemini snabb|standard|djup [fri fråga]   (djup bara för owner)
+#   2. Label              ai:snabb | ai:standard | ai:djup
+#   3. Default            snabb
+# Ingen nivå eskalerar automatiskt: modellreserven inom en nivå går bara till samma eller
+# billigare modell.
+
+owner: Jan-Christian-Thoren
+default_tier: snabb
+command_associations: [OWNER, MEMBER, COLLABORATOR]   # vilka som får använda /gemini
+max_input_bytes: 200000          # större diff eller bilagor trunkeras och det står i rapporten
+djup_per_item_per_hour: 1        # högst ett djup-anrop per PR/issue och timme
+heartbeat_s: 60                  # livstecken i Actions-loggen medan ett anrop pågår
+
+# Tidsgränser per nivå: request_timeout_s per modellanrop, run_budget_s för hela körningen
+# (alla försök och reservmodeller). Jobbets timeout-minutes i workflowen ska vara större än
+# run_budget_s plus uppstart, så att en statusrapport hinner postas i stället för att GitHub
+# dödar jobbet. Uppmätt på Vertex (djup + sökning + hög thinking): median ~6,7 min, p95 ~8,7 min.
+
+tiers:
+  snabb:
+    description: PR-sammanfattning, lint-förklaring, statusrapport
+    models: [gemini-3.8-flash]
+    thinking_level: minimal
+    max_output_tokens: 2000
+    grounding: false
+    request_timeout_s: 180
+    run_budget_s: 420
+    job_timeout_minutes: 12
+  standard:
+    description: vanlig kodgranskning
+    models: [gemini-3.1-pro-preview, gemini-2.5-pro]
+    thinking_level: low
+    max_output_tokens: 6000
+    grounding: false
+    request_timeout_s: 360
+    run_budget_s: 720
+    job_timeout_minutes: 18
+  djup:
+    description: arkitektur, svår felsökning, säkerhet, utredningar
+    models: [gemini-4-argon, gemini-3.1-pro-preview, gemini-2.5-pro]
+    thinking_level: high
+    max_output_tokens: 16000
+    grounding: true
+    request_timeout_s: 660
+    run_budget_s: 1380
+    job_timeout_minutes: 28
+
+# Gamla profilnamn (GEMINI_PROFILE) pekar på en nivå.
+aliases:
+  standard_review: snabb
+  deep_investigation: djup
+
+# UPPSKATTNING. USD per 1 miljon tokens; resonemangstokens debiteras som utdata.
+# PLATSHÅLLARE: verifiera mot Vertex AI:s prislista och oktoberfakturan innan siffrorna används
+# till något annat än att jämföra nivåer med varandra.
+pricing:
+  usd_to_sek: 10.5
+  models:
+    gemini-3.8-flash:       {input: 0.30, output: 2.50}
+    gemini-3.1-pro-preview: {input: 2.00, output: 12.00}
+    gemini-2.5-pro:         {input: 1.25, output: 10.00}
+    gemini-4-argon:         {input: 4.00, output: 24.00}
