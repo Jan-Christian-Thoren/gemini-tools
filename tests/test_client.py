@@ -346,6 +346,7 @@ def test_audit_reports_tier_tokens_and_cost(monkeypatch):
     install(monkeypatch, list(c.ALL_APPROVED_MODELS), {m: resp for m in c.ALL_APPROVED_MODELS})
     r = c.run_resilient_generation("p", "sys", profile_name="snabb", tier_source="label")
     assert "Nivå:** `snabb (label)`" in r.audit_md
+    assert "Resonemang:** `low`" in r.audit_md         # minimal stöds inte av Flash
     assert "Tokens:** in 1000 · ut 500 · varav thinking 1500" in r.audit_md
     assert "Uppskattad kostnad:** `" in r.audit_md and "uppskattning" in r.audit_md
     assert r.usage == {"input": 1000, "output": 500, "thinking": 1500}

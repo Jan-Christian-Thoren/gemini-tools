@@ -101,3 +101,15 @@ def test_should_run_reports_denied_command_but_ignores_plain_comments():
     assert tiers.should_run("issue_comment", {}, tiers.TierChoice(None, "kommando", denied="ingen /gemini-rad"), False, False) == (False, "")
     run, note = tiers.should_run("issue_comment", {}, tiers.TierChoice(None, "kommando", denied="djup via kommando kräver repo-ägaren"), False, False)
     assert not run and "ägaren" in note
+
+
+def test_unsupported_thinking_level_is_raised_to_nearest_supported():
+    assert tiers.supported_thinking_level(CFG, "gemini-3.8-flash", "minimal") == "low"
+    assert tiers.supported_thinking_level(CFG, "gemini-4-argon", "high") == "high"
+    assert tiers.supported_thinking_level(CFG, "okand-modell", "minimal") == "minimal"
+    assert tiers.supported_thinking_level(CFG, "gemini-2.5-pro", "high") == ""     # budget-modell: ingen nivå
+
+
+def test_tiers_only_use_models_that_answered_on_vertex_global():
+    for t in CFG["tiers"].values():
+        assert "gemini-2.5-pro" not in t["models"]

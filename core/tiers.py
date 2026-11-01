@@ -140,3 +140,22 @@ def should_run(event_name: str, event: dict, choice: TierChoice, has_previous_re
 
 def command_or_label_note(choice: TierChoice) -> str:
     return f"{choice.tier} ({choice.source})"
+
+
+LEVEL_ORDER = ("minimal", "low", "medium", "high")
+
+
+def supported_thinking_level(cfg: dict, model: str, level: str) -> str:
+    """Nivåns thinking_level justerad till vad modellen stöder: samma om den stöds, annars
+    närmaste stödda nivå uppåt (sist: högsta stödda). Okänd modell: oförändrad."""
+    params = (cfg.get("model_params") or {}).get(model)
+    if not params or not level:
+        return level
+    allowed = [l.lower() for l in params.get("thinking_levels") or []]
+    if not allowed or level.lower() in allowed:
+        return level if allowed else ""
+    start = LEVEL_ORDER.index(level.lower()) if level.lower() in LEVEL_ORDER else 0
+    for l in LEVEL_ORDER[start:]:
+        if l in allowed:
+            return l
+    return allowed[-1]

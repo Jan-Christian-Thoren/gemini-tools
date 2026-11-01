@@ -32,7 +32,7 @@ tiers:
     job_timeout_minutes: 12
   standard:
     description: vanlig kodgranskning
-    models: [gemini-3.1-pro-preview, gemini-2.5-pro]
+    models: [gemini-3.1-pro-preview]
     thinking_level: low
     max_output_tokens: 6000
     grounding: false
@@ -41,13 +41,22 @@ tiers:
     job_timeout_minutes: 18
   djup:
     description: arkitektur, svår felsökning, säkerhet, utredningar
-    models: [gemini-4-argon, gemini-3.1-pro-preview, gemini-2.5-pro]
+    models: [gemini-4-argon, gemini-3.1-pro-preview]
     thinking_level: high
     max_output_tokens: 16000
     grounding: true
     request_timeout_s: 660
     run_budget_s: 1380
     job_timeout_minutes: 28
+
+# Vad varje modell stöder (verifierat med tools/smoke_test.py på Vertex AI global, 2026-11-01).
+# En nivås thinking_level som modellen inte stöder höjs till närmaste stödda nivå uppåt.
+# gemini-2.5-pro listas av models.list() men ger 404 på global och används därför inte i nivåerna.
+model_params:
+  gemini-3.8-flash:       {thinking_levels: [low, medium, high]}       # MINIMAL ger 400
+  gemini-3.1-pro-preview: {thinking_levels: [low, medium, high]}
+  gemini-4-argon:         {thinking_levels: [low, medium, high]}       # low/medium ej provade
+  gemini-2.5-pro:         {thinking_levels: [], thinking_budget: true}
 
 # Gamla profilnamn (GEMINI_PROFILE) pekar på en nivå.
 aliases:

@@ -475,7 +475,7 @@ def run_resilient_generation(
                 model_name=model_name,
                 system_instruction=system_instruction,
                 temperature=temperature,
-                thinking_level=profile.thinking_level,
+                thinking_level=tiers.supported_thinking_level(cfg, model_name, profile.thinking_level),
                 grounding=grounding,
                 max_output_tokens=profile.max_output_tokens,
             )
