@@ -8,7 +8,7 @@ Alla anrop körs på en av tre nivåer. Modeller, resonemang, utdatagränser, ti
 
 | Nivå | Används för | Modell (enligt konfigurationen) | Resonemang | Max utdata |
 | --- | --- | --- | --- | --- |
-| `snabb` | standard: PR-sammanfattning, lint-förklaring, statusrapport | Flash | minimal | ~2 000 tokens |
+| `snabb` | standard: PR-sammanfattning, lint-förklaring, statusrapport | Flash | låg (Flash stöder inte minimal) | ~2 000 tokens |
 | `standard` | vanlig kodgranskning | Pro | låg | ~6 000 tokens |
 | `djup` | arkitektur, svår felsökning, säkerhet | Argon | hög | ~16 000 tokens |
 
@@ -25,6 +25,13 @@ Ingenting eskalerar av sig självt: en modell som inte svarar ersätts bara av s
 - En ai-label sätts eller ett `/gemini`-kommando skrivs: alltid en ny körning.
 - Issues: etiketten `utredning` startar en utredning; `/gemini …` i en kommentar kör om den.
 - `djup` körs högst en gång per PR eller issue och timme.
+
+**Starta en utredning i rätt ordning.** Annars kan flera workflows starta samtidigt, med halvfärdig text eller fel nivå:
+1. Skapa issuet **utan etiketter** och skriv klart titel och beskrivning: frågan, sammanhanget och filer som ska bifogas (sökväg i backticks, t.ex. `` `docs/EV.md` ``).
+2. Sätt en eventuell nivåetikett (`ai:standard` eller `ai:djup`). Utan `utredning` startar den ingenting.
+3. Sätt `utredning` **sist**, som ett eget steg.
+
+Skapa aldrig issuet med etiketterna direkt (`gh issue create --label utredning,ai:djup` eller `labels` i API-anropet). GitHub skickar då en händelse per etikett, och två körningar startar. Har beskrivningen ändrats efter starten: kör om med `/gemini <nivå>`. Att ta bort och sätta tillbaka `utredning` startar ingen ny körning.
 
 **Skydd:** diff eller bilagor över 200 kB trunkeras och det står i rapporten. Varje nivå har en tidsgräns per anrop och en total tidsbudget, så att en statusrapport hinner postas innan jobbet når sin egen tidsgräns. Loggen visar löpande vad som händer, med ett livstecken varje minut under långa anrop.
 
