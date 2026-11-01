@@ -6,7 +6,7 @@ from pathlib import Path
 # Lägg till repots rot så att core/ kan importeras oavsett var skriptet körs ifrån
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from core import tiers
-from core.client import get_github_context, load_system_role, run_resilient_generation
+from core.client import apply_repo_budget, get_github_context, load_system_role, run_resilient_generation
 
 DEFAULT_ROLE = (
     "Du är en teknisk utredare och senior mjukvaruarkitekt. "
@@ -21,9 +21,11 @@ STATUS_SKIPPED_HEADER = "## ⏸️ Gemini Utredning – ingen körning"
 def main():
     issue_number = int(os.environ["ISSUE_NUMBER"])
     _, repo = get_github_context()
-    issue = repo.get_issue(number=issue_number)
     cfg = tiers.load_config()
     event_name, event = tiers.load_github_event()
+    tiers.settle(cfg, event_name, event)
+    issue = repo.get_issue(number=issue_number)  # läses efter väntan: aktuell text och aktuella etiketter
+    event = tiers.with_fresh_labels(event, [l.name for l in issue.labels])
     choice = tiers.select_tier(cfg, event_name, event)
 
     print(f"Hanterar Issue #{issue_number}: {issue.title} (händelse {event_name or 'okänd'})")
@@ -32,6 +34,8 @@ def main():
     has_previous = any(REPORT_HEADER in (c.body or "") for c in comments)
     recent_djup = tiers.djup_recently_used([(c.body, c.created_at) for c in comments], cfg)
     run, note = tiers.should_run(event_name, event, choice, has_previous, recent_djup)
+    if run:
+        choice = apply_repo_budget(repo, cfg, choice)
     if not run:
         if note:
             issue.create_comment(f"{STATUS_SKIPPED_HEADER}\n\n{note}. Ingen modell anropades.")

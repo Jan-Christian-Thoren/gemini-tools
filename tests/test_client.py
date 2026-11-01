@@ -374,3 +374,47 @@ def test_progress_is_logged(monkeypatch, capsys):
     c.run_resilient_generation("p", "sys", profile_name="snabb")
     out = capsys.readouterr().out
     assert "start: nivå snabb" in out and "anrop 1/3 till gemini-3.8-flash" in out and "klart med" in out
+
+
+def test_no_grounding_forbids_invented_sources(monkeypatch):
+    class Models(FakeModels):
+        def generate_content(self, model, contents, config):
+            self.calls.append((bool(getattr(config, "tools", None)), config.system_instruction))
+            return ok_response()
+
+    for profile, grounded in (("standard_review", False), ("deep_investigation", True)):
+        fake = install(monkeypatch, list(c.ALL_APPROVED_MODELS), {})
+        fake.models = Models(list(c.ALL_APPROVED_MODELS), {})
+        assert run(profile).success
+        tools_on, instruction = fake.models.calls[0]
+        assert tools_on is grounded
+        assert (c.NO_GROUNDING_NOTE in instruction) is (not grounded)
+
+
+def test_budget_check_failure_never_blocks(monkeypatch):
+    from core import tiers
+
+    class Repo:
+        def get_issues_comments(self, since):
+            raise RuntimeError("nät")
+
+    ch = tiers.TierChoice("djup", "label")
+    assert c.apply_repo_budget(Repo(), tiers.load_config(), ch) is ch
+
+
+def test_budget_counts_only_bot_comments_this_month(monkeypatch):
+    from datetime import timedelta
+    from core import tiers
+    start = tiers.month_start()
+    cost = "- **Uppskattad kostnad:** `15.00 kr` (x)"
+    comments = [SimpleNamespace(body=cost, user=SimpleNamespace(type="Bot"), created_at=start + timedelta(hours=1)),
+                SimpleNamespace(body=cost, user=SimpleNamespace(type="Bot"), created_at=start + timedelta(hours=2)),
+                SimpleNamespace(body=cost, user=SimpleNamespace(type="User"), created_at=start + timedelta(hours=3))]
+
+    class Repo:
+        def get_issues_comments(self, since):
+            return comments
+
+    assert c.repo_spend_this_month(Repo()) == 30.0
+    ch = c.apply_repo_budget(Repo(), tiers.load_config(), tiers.TierChoice("standard", "label"))
+    assert ch.tier == "snabb"

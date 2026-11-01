@@ -15,6 +15,15 @@ command_associations: [OWNER, MEMBER, COLLABORATOR]   # vilka som får använda 
 max_input_bytes: 200000          # större diff eller bilagor trunkeras och det står i rapporten
 djup_per_item_per_hour: 1        # högst ett djup-anrop per PR/issue och timme
 heartbeat_s: 60                  # livstecken i Actions-loggen medan ett anrop pågår
+settle_s: 20                     # väntan vid etikett-/öppna-händelser; samlar flera etiketter till en körning
+
+# Månadsbudget per repo, räknad på de uppskattade kostnaderna i botens sidfötter sedan den 1:a.
+# Över gränsen körs standard och djup som snabb (det står i sidfoten). Snabb påverkas inte.
+# PLATSHÅLLARE: sätt värdet när pristabellen stämts av mot fakturan.
+budget:
+  monthly_sek_per_repo: 20
+  applies_to: [standard, djup]
+  fallback_tier: snabb
 
 # Tidsgränser per nivå: request_timeout_s per modellanrop, run_budget_s för hela körningen
 # (alla försök och reservmodeller). Jobbets timeout-minutes i workflowen ska vara större än

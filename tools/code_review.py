@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from core import tiers
-from core.client import get_github_context, load_system_role, run_resilient_generation
+from core.client import apply_repo_budget, get_github_context, load_system_role, run_resilient_generation
 
 DEFAULT_ROLE = (
     "Du är en Principal Software Engineer. Utför en noggrann, saklig och konstruktiv "
@@ -19,9 +19,11 @@ STATUS_SKIPPED_HEADER = "## ⏸️ Gemini Code Review – ingen körning"
 def main():
     pr_number = int(os.environ["PR_NUMBER"])
     _, repo = get_github_context()
-    pr = repo.get_pull(pr_number)
     cfg = tiers.load_config()
     event_name, event = tiers.load_github_event()
+    tiers.settle(cfg, event_name, event)
+    pr = repo.get_pull(pr_number)  # läses efter väntan: aktuell text och aktuella etiketter
+    event = tiers.with_fresh_labels(event, [l.name for l in pr.labels])
     choice = tiers.select_tier(cfg, event_name, event)
 
     print(f"Hanterar PR #{pr_number}: {pr.title} (händelse {event_name or 'okänd'})")
@@ -30,6 +32,8 @@ def main():
     has_previous = any(REVIEW_HEADER in (c.body or "") for c in comments)
     recent_djup = tiers.djup_recently_used([(c.body, c.created_at) for c in comments], cfg)
     run, note = tiers.should_run(event_name, event, choice, has_previous, recent_djup)
+    if run:
+        choice = apply_repo_budget(repo, cfg, choice)
     if not run:
         if note:
             pr.create_issue_comment(f"{STATUS_SKIPPED_HEADER}\n\n{note}. Ingen modell anropades.")

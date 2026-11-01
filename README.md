@@ -35,6 +35,12 @@ Skapa aldrig issuet med etiketterna direkt (`gh issue create --label utredning,a
 
 **Skydd:** diff eller bilagor över 200 kB trunkeras och det står i rapporten. Varje nivå har en tidsgräns per anrop och en total tidsbudget, så att en statusrapport hinner postas innan jobbet når sin egen tidsgräns. Loggen visar löpande vad som händer, med ett livstecken varje minut under långa anrop.
 
+**Flera etiketter på en gång** ger ändå bara en körning. Vid etikett- och öppna-händelser väntar körningen `settle_s` (20 s) innan modellen anropas. Kommer en till händelse under tiden avbryts den första körningen (workflowens concurrency), och den sista läser issuet eller PR:en på nytt: aktuell text och aktuella etiketter. Ordningen ovan gäller ändå, så att texten är klar när körningen startar.
+
+**Månadsbudget per repo:** botens sidfötter sedan den 1:a summeras. Över `budget.monthly_sek_per_repo` körs `standard` och `djup` som `snabb`, och det står i sidfoten (`Nivå: snabb (…, nedgraderad från djup: månadsbudget …)`). Snabb påverkas inte. Gränsen räknas på uppskattningarna, inte på fakturan.
+
+**Källor:** utan webbsökning (snabb och standard) instrueras modellen att inte hänvisa till källor som inte finns i underlaget. Riktiga länkar finns bara när grounding är på, under "Referenser & Källor".
+
 **Sidfoten i varje bot-kommentar** visar plattform (Vertex AI eller AI Studio), nivå och hur den valdes, modell, tokens (in, ut och varav thinking) och en uppskattad kostnad i kronor från pristabellen i konfigurationen. Priserna där är uppskattningar och ska stämmas av mot fakturan.
 
 ## Plattform

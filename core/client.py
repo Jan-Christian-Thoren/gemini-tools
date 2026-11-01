@@ -91,6 +91,29 @@ def get_github_context():
     return gh, gh.get_repo(repo_name)
 
 
+def repo_spend_this_month(repo) -> float:
+    """Uppskattad kostnad i kr i repots bot-kommentarer sedan månadens början."""
+    since = tiers.month_start()
+    bodies = [c.body for c in repo.get_issues_comments(since=since)
+              if getattr(c.user, "type", "") == "Bot" and c.created_at >= since]
+    return tiers.spent_this_month(bodies)
+
+
+def apply_repo_budget(repo, cfg: dict, choice: "tiers.TierChoice") -> "tiers.TierChoice":
+    applies = (cfg.get("budget") or {}).get("applies_to") or []
+    if choice.tier not in applies:
+        return choice
+    try:
+        spent = repo_spend_this_month(repo)
+    except Exception as err:  # budgetkollen får aldrig stoppa en körning
+        print(f"Budgetkontroll misslyckades ({type(err).__name__}); kör vald nivå")
+        return choice
+    new = tiers.apply_budget(cfg, choice, spent)
+    print(f"Månadens uppskattade kostnad i repot: {spent:.2f} kr"
+          + (f"; {new.source}" if new is not choice else ""))
+    return new
+
+
 def load_system_role(default_role: str) -> tuple[str, str]:
     """
     Läser in .github/gemini_role.md från det anropande repot.
@@ -401,6 +424,17 @@ def _extract_sources(response) -> str:
     return ""
 
 
+NO_GROUNDING_NOTE = (
+    "\n\n---\nWebbsökning (grounding) är avstängd i den här körningen. Hänvisa inte till källor, "
+    "länkar, dokumenttitlar eller utgåvor som inte finns i underlaget du fått. Bygger ett påstående "
+    "på allmän kunskap, skriv det som allmän kunskap och markera det som overifierat."
+)
+
+
+def effective_system_instruction(system_instruction: str, grounding: bool) -> str:
+    return system_instruction if grounding else system_instruction + NO_GROUNDING_NOTE
+
+
 def run_resilient_generation(
     prompt: str,
     system_instruction: str,
@@ -473,7 +507,7 @@ def run_resilient_generation(
         def make_config():
             return build_generation_config(
                 model_name=model_name,
-                system_instruction=system_instruction,
+                system_instruction=effective_system_instruction(system_instruction, grounding),
                 temperature=temperature,
                 thinking_level=tiers.supported_thinking_level(cfg, model_name, profile.thinking_level),
                 grounding=grounding,

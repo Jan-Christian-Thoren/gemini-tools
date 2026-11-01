@@ -121,3 +121,62 @@ def test_unsupported_thinking_level_is_raised_to_nearest_supported():
 def test_tiers_only_use_models_that_answered_on_vertex_global():
     for t in CFG["tiers"].values():
         assert "gemini-2.5-pro" not in t["models"]
+
+
+# --- samlad start ---------------------------------------------------------------------------------
+
+def test_settle_only_for_label_and_open_events():
+    waits = []
+    issue_labeled = {"action": "labeled", "issue": {"labels": []}, "label": {"name": "utredning"}}
+    assert tiers.settle(CFG, "issues", issue_labeled, sleep=waits.append) == CFG["settle_s"] > 0
+    assert tiers.settle(CFG, "pull_request", pr(action="opened"), sleep=waits.append) == CFG["settle_s"]
+    assert tiers.settle(CFG, "issue_comment", comment("/gemini snabb"), sleep=waits.append) == 0
+    assert tiers.settle(CFG, "pull_request", pr(action="synchronize"), sleep=waits.append) == 0
+    assert waits == [CFG["settle_s"], CFG["settle_s"]]
+
+
+def test_issue_created_with_both_labels_runs_at_the_chosen_level_from_either_event():
+    # issuet skapades med utredning + ai:djup: två händelser, båda ska ge djup efter omläsning
+    fresh = ["utredning", "ai:djup"]
+    for added in ("utredning", "ai:djup"):
+        ev = {"action": "labeled", "issue": {"number": 7, "labels": [{"name": "utredning"}]},
+              "label": {"name": added}}
+        ch = tiers.select_tier(CFG, "issues", tiers.with_fresh_labels(ev, fresh))
+        assert ch.tier == "djup", added
+
+
+def test_fresh_labels_replace_the_payload_labels_for_prs():
+    ev = tiers.with_fresh_labels(pr(labels=["ai:djup"]), ["ai:snabb"])
+    assert tiers.select_tier(CFG, "pull_request", ev).tier == "snabb"
+
+
+# --- månadsbudget ---------------------------------------------------------------------------------
+
+def footer(kr):
+    return f"...\n- **Uppskattad kostnad:** `{kr} kr` (uppskattning från pristabellen i gemini-tiers.yml)\n"
+
+
+def test_spent_sums_footer_costs():
+    assert tiers.spent_this_month([footer("1.29"), footer("0.06"), "inget", None]) == pytest.approx(1.35)
+
+
+def test_over_budget_downgrades_standard_and_djup_only():
+    limit = CFG["budget"]["monthly_sek_per_repo"]
+    for t in ("standard", "djup"):
+        ch = tiers.apply_budget(CFG, tiers.TierChoice(t, "label", "fråga"), limit + 0.01)
+        assert ch.tier == "snabb" and "nedgraderad från " + t in ch.source and ch.extra_prompt == "fråga"
+    keep = tiers.TierChoice("snabb", "default")
+    assert tiers.apply_budget(CFG, keep, limit * 10) is keep
+    under = tiers.TierChoice("djup", "kommando")
+    assert tiers.apply_budget(CFG, under, limit - 1) is under
+
+
+def test_downgraded_run_does_not_count_as_djup_for_the_rate_limit():
+    now = datetime(2026, 11, 1, 12, tzinfo=timezone.utc)
+    body = "- **Nivå:** `snabb (label, nedgraderad från djup: månadsbudget 21.00 av 20 kr använd)`"
+    assert not tiers.djup_recently_used([(body, now)], CFG, now)
+
+
+def test_month_start():
+    assert tiers.month_start(datetime(2026, 11, 17, 9, 5, tzinfo=timezone.utc)) == \
+        datetime(2026, 11, 1, tzinfo=timezone.utc)

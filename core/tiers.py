@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -159,3 +160,66 @@ def supported_thinking_level(cfg: dict, model: str, level: str) -> str:
         if l in allowed:
             return l
     return allowed[-1]
+
+
+# --- Samlad start: flera etikett-händelser i följd ger bara en körning ----------------------------
+SETTLE_ACTIONS = ("opened", "labeled", "reopened")
+
+
+def settle_seconds(cfg: dict, event_name: str, event: dict) -> int:
+    """Väntetid före modellanropet för etikett- och öppna-händelser. Workflowens concurrency
+    (cancel-in-progress) avbryter då en tidigare körning när nästa händelse kommer, innan någon
+    modell anropats, och den sista körningen läser issuet/PR:en på nytt efter väntan."""
+    if event_name in ("issues", "pull_request") and event.get("action") in SETTLE_ACTIONS:
+        return int(cfg.get("settle_s", 0))
+    return 0
+
+
+def settle(cfg: dict, event_name: str, event: dict, sleep=time.sleep) -> int:
+    s = settle_seconds(cfg, event_name, event)
+    if s:
+        print(f"Väntar {s} s på fler etikett-händelser innan körningen", flush=True)
+        sleep(s)
+    return s
+
+
+def with_fresh_labels(event: dict, label_names: list[str]) -> dict:
+    """Kopia av händelsen där PR:ens/issuets etiketter ersatts med de aktuella."""
+    ev = dict(event)
+    key = "pull_request" if "pull_request" in ev and "issue" not in ev else "issue"
+    item = dict(ev.get(key) or {})
+    item["labels"] = [{"name": n} for n in label_names]
+    ev[key] = item
+    return ev
+
+
+# --- Månadsbudget per repo ------------------------------------------------------------------------
+COST_RE = re.compile(r"\*\*Uppskattad kostnad:\*\* `([0-9]+(?:\.[0-9]+)?) kr`")
+
+
+def month_start(now: Optional[datetime] = None) -> datetime:
+    now = now or datetime.now(timezone.utc)
+    return now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def spent_this_month(bot_comment_bodies: list[str]) -> float:
+    """Summan av uppskattade kostnader i bot-kommentarernas sidfötter (anroparen filtrerar på
+    författare och månad)."""
+    total = 0.0
+    for body in bot_comment_bodies:
+        for m in COST_RE.finditer(body or ""):
+            total += float(m.group(1))
+    return total
+
+
+def apply_budget(cfg: dict, choice: TierChoice, spent_sek: float) -> TierChoice:
+    """Över månadsbudgeten körs nivåerna i budget.applies_to som snabb i stället. Sänker bara."""
+    b = cfg.get("budget") or {}
+    limit = b.get("monthly_sek_per_repo")
+    if choice.tier is None or limit is None or choice.tier not in (b.get("applies_to") or []):
+        return choice
+    if spent_sek < float(limit):
+        return choice
+    note = (f"{choice.source}, nedgraderad från {choice.tier}: månadsbudget "
+            f"{spent_sek:.2f} av {float(limit):.0f} kr använd")
+    return TierChoice(b.get("fallback_tier", "snabb"), note, choice.extra_prompt)
