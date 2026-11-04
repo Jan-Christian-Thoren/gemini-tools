@@ -26,6 +26,11 @@ class FakeModels:
             raise outcome
         return outcome
 
+    def generate_content_stream(self, model, contents, config):
+        # samma utfall som ett vanligt anrop, levererat som en enda del
+        self.streamed = getattr(self, "streamed", []) + [model]
+        yield self.generate_content(model, contents, config)
+
 
 class FakeClient:
     def __init__(self, names, outcomes):
@@ -502,8 +507,8 @@ def test_worst_case_argon_leaves_budget_for_the_reserve(monkeypatch):
     assert r.success and r.chosen_model == "gemini-3.1-pro-preview"
     djup = c.PROFILES["djup"]
     policy = c.tiers.model_policy(c.tiers.load_config(), "gemini-4-argon", djup.request_timeout_s)
-    worst = policy.max_attempts * policy.request_timeout_s + 5
-    assert worst + djup.request_timeout_s <= djup.run_budget_s
+    # ett långt försök (> slow_attempt_s) går direkt till reserven, som då får hela sin gräns
+    assert policy.max_call_s + 5 + djup.request_timeout_s <= djup.run_budget_s
 
 
 def test_other_models_keep_three_attempts(monkeypatch):
@@ -511,3 +516,83 @@ def test_other_models_keep_three_attempts(monkeypatch):
                                                              ok_response()]})
     assert c.run_resilient_generation("p", "sys", profile_name="snabb").success
     assert fake.models.calls == ["gemini-3.8-flash"] * 3
+
+
+
+# --- strömning ------------------------------------------------------------------------------------
+
+def chunk(text=None, finish=None, grounding=None, usage=None, raise_text=False):
+    class C:
+        candidates = [SimpleNamespace(finish_reason=finish, grounding_metadata=grounding)]
+        usage_metadata = usage
+
+        @property
+        def text(self):
+            if raise_text:
+                raise ValueError("inga textdelar")
+            return text
+    return C()
+
+
+def test_merge_stream_joins_text_and_keeps_last_metadata():
+    g = SimpleNamespace(grounding_chunks=[])
+    u = SimpleNamespace(prompt_token_count=10, candidates_token_count=5, thoughts_token_count=7,
+                        tool_use_prompt_token_count=0)
+    r = c.merge_stream([chunk(None), chunk(raise_text=True), chunk("Hej "), chunk("världen", grounding=g),
+                        chunk(None, finish="FinishReason.STOP", usage=u)])
+    assert r.text == "Hej världen"
+    assert r.candidates[0].finish_reason == "FinishReason.STOP" and r.candidates[0].grounding_metadata is g
+    assert c.validate_response(r)[0] and c.extract_usage(r)["thinking"] == 7
+
+
+def test_merge_stream_without_content_is_rejected():
+    assert not c.validate_response(c.merge_stream([]))[0]
+
+
+def test_argon_is_streamed_with_thought_summaries_and_others_are_not(monkeypatch):
+    fake = install_script(monkeypatch, {"gemini-4-argon": [ok_response()]})
+    assert c.run_resilient_generation("p", "sys", profile_name="djup").success
+    assert fake.models.streamed == ["gemini-4-argon"]
+    _, cfg = fake.models.configs[0]
+    assert cfg.thinking_config.include_thoughts is True
+
+    fake = install_script(monkeypatch, {"gemini-3.8-flash": [ok_response()]})
+    assert c.run_resilient_generation("p", "sys", profile_name="snabb").success
+    assert getattr(fake.models, "streamed", []) == []
+
+
+def test_error_inside_the_stream_is_handled_like_a_call_error(monkeypatch):
+    fake = install_script(monkeypatch, {"gemini-4-argon": [httpx.RemoteProtocolError("x")],
+                                        "gemini-3.1-pro-preview": [ok_response()]},
+                          durations={"gemini-4-argon": 300})
+    r = c.run_resilient_generation("p", "sys", profile_name="djup")
+    assert r.success and r.chosen_model == "gemini-3.1-pro-preview"
+
+
+def test_stream_longer_than_its_cap_is_a_timeout(monkeypatch):
+    clock = {"t": 0.0}
+    monkeypatch.setattr(c.time, "monotonic", lambda: clock["t"])
+
+    def endless():
+        while True:
+            clock["t"] += 100
+            yield chunk("x")
+
+    class M:
+        def generate_content_stream(self, model, contents, config):
+            return endless()
+
+    with pytest.raises(httpx.ReadTimeout):
+        c.generate(SimpleNamespace(models=M()), "gemini-4-argon", "p", SimpleNamespace(thinking_config=None),
+                   stream=True, max_total_s=600)
+
+
+def test_no_retry_on_argon_when_it_would_starve_the_reserve(monkeypatch):
+    # 150 s in: ett nytt argon-försök (600 s) plus reservens 660 s ryms inte i budgeten 1380 s
+    fake = install_script(monkeypatch, {
+        "gemini-4-argon": [httpx.ConnectError("x"), ok_response()],
+        "gemini-3.1-pro-preview": [ok_response()],
+    }, durations={"gemini-4-argon": 150})
+    r = c.run_resilient_generation("p", "sys", profile_name="djup")
+    assert r.success and fake.models.calls == ["gemini-4-argon", "gemini-3.1-pro-preview"]
+    assert "inget omförsök" in r.audit_md

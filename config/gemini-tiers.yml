@@ -63,7 +63,7 @@ tiers:
 # En nivås thinking_level som modellen inte stöder höjs till närmaste stödda nivå uppåt.
 # gemini-2.5-pro listas av models.list() men ger 404 på global och används därför inte i nivåerna.
 # Per modell: thinking_levels som stöds, och valfritt request_timeout_s (ersätter nivåns),
-# max_attempts (standard 3), slow_attempt_s och retry_thinking_level.
+# max_attempts (standard 3), slow_attempt_s, retry_thinking_level och stream.
 model_params:
   gemini-3.8-flash:       {thinking_levels: [low, medium, high]}       # MINIMAL ger 400
   gemini-3.1-pro-preview: {thinking_levels: [low, medium, high]}
@@ -75,6 +75,10 @@ model_params:
     max_attempts: 2
     slow_attempt_s: 180
     retry_thinking_level: medium
+    # Strömmat svar med resonemangssammanfattningar: förbindelsen är aldrig tyst under långt
+    # resonemang. Utan strömning stängdes den efter ~320 s (RemoteProtocolError, ev-core#21).
+    stream: true
+    stream_total_s: 600            # tak för hela det strömmade svaret
   gemini-2.5-pro:         {thinking_levels: [], thinking_budget: true}
 
 # Gamla profilnamn (GEMINI_PROFILE) pekar på en nivå.

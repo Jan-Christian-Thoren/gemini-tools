@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 import os
 import re
 import sys
@@ -441,6 +442,43 @@ def effective_system_instruction(system_instruction: str, grounding: bool) -> st
     return system_instruction if grounding else system_instruction + NO_GROUNDING_NOTE
 
 
+def merge_stream(chunks) -> SimpleNamespace:
+    """Slår ihop strömmade delsvar till ett svar med samma fält som ett vanligt anrop:
+    text (utan resonemangsdelar), sista finish_reason, grounding_metadata och usage_metadata."""
+    texts, finish, grounding, usage = [], None, None, None
+    for ch in chunks:
+        try:
+            t = ch.text
+        except Exception:
+            t = None
+        if t:
+            texts.append(t)
+        cand = (getattr(ch, "candidates", None) or [None])[0]
+        if cand is not None:
+            finish = getattr(cand, "finish_reason", None) or finish
+            grounding = getattr(cand, "grounding_metadata", None) or grounding
+        usage = getattr(ch, "usage_metadata", None) or usage
+    candidates = [SimpleNamespace(finish_reason=finish, grounding_metadata=grounding)] if finish or texts else []
+    return SimpleNamespace(text="".join(texts), candidates=candidates, usage_metadata=usage)
+
+
+def _bounded(chunks, max_total_s: Optional[int]):
+    t0 = time.monotonic()
+    for ch in chunks:
+        yield ch
+        if max_total_s and time.monotonic() - t0 > max_total_s:
+            raise httpx.ReadTimeout(f"strömmat svar längre än {max_total_s} s")
+
+
+def generate(client, model: str, prompt: str, config, stream: bool = False, max_total_s: Optional[int] = None):
+    if not stream:
+        return client.models.generate_content(model=model, contents=prompt, config=config)
+    if getattr(config, "thinking_config", None) is not None:
+        config.thinking_config.include_thoughts = True   # håller strömmen vid liv under resonemanget
+    stream_iter = client.models.generate_content_stream(model=model, contents=prompt, config=config)
+    return merge_stream(_bounded(stream_iter, max_total_s))
+
+
 def run_resilient_generation(
     prompt: str,
     system_instruction: str,
@@ -533,13 +571,14 @@ def run_resilient_generation(
         while attempt < max_attempts:
             attempt += 1
             elapsed = time.monotonic() - started
-            if budget and elapsed + (policy.request_timeout_s or 0) > budget:
+            if budget and elapsed + policy.max_call_s > budget:
                 fallback_reasons.append(f"{model_name}: tidsbudget {budget} s räcker inte för ett nytt anrop")
                 log(f"stopp: {int(elapsed)} s använt, budgeten {budget} s räcker inte för ett nytt anrop")
                 abort_all = True
                 break
             log(f"anrop {attempt}/{max_attempts} till {model_name} (grounding {'på' if grounding else 'av'}, "
-                f"resonemang {applied_thinking or 'standard'}, tidsgräns {policy.request_timeout_s or 'ingen'} s)")
+                f"resonemang {applied_thinking or 'standard'}, "
+                f"{'strömmat, tystnadsgräns' if policy.stream else 'tidsgräns'} {policy.request_timeout_s or 'ingen'} s)")
             t0 = time.monotonic()
             done = threading.Event()
 
@@ -548,11 +587,8 @@ def run_resilient_generation(
                     log(f"väntar på svar från {model}: {int(time.monotonic() - t_start)} s")
             threading.Thread(target=heartbeat, daemon=True).start()
             try:
-                resp = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=config,
-                )
+                resp = generate(client, model_name, prompt, config, stream=policy.stream,
+                                max_total_s=policy.stream_total_s)
                 log(f"svar från {model_name} efter {int(time.monotonic() - t0)} s")
             except Exception as err:
                 log(f"fel från {model_name} efter {int(time.monotonic() - t0)} s: {classify_error(err)[1]}"
@@ -583,6 +619,14 @@ def run_resilient_generation(
                     # Ett långsamt misslyckande upprepas inte: spara budgeten åt reservmodellen
                     fallback_reasons.append(f"{model_name}: {sanitized_reason} efter {int(took)} s")
                     log(f"{model_name}: försöket tog {int(took)} s (> {policy.slow_attempt_s} s), direkt till reserven")
+                    break
+                # Omförsök bara om reservmodellen ändå får hela sin tidsgräns efteråt
+                rest = candidate_models[candidate_models.index(model_name) + 1:]
+                reserve_s = tiers.model_policy(cfg, rest[0], profile.request_timeout_s).max_call_s if rest else 0
+                if (attempt < max_attempts and budget and rest
+                        and time.monotonic() - started + delay + policy.max_call_s + reserve_s > budget):
+                    fallback_reasons.append(f"{model_name}: {sanitized_reason}; inget omförsök, tiden behövs för {rest[0]}")
+                    log(f"{model_name}: hoppar över omförsök så att {rest[0]} får hela sin tidsgräns")
                     break
                 if attempt < max_attempts:
                     if policy.retry_thinking_level and policy.retry_thinking_level != thinking:

@@ -231,6 +231,15 @@ class ModelPolicy:
     max_attempts: int = 3
     slow_attempt_s: Optional[int] = None      # misslyckat försök längre än så: direkt till reserven
     retry_thinking_level: str = ""            # resonemang vid omförsök på samma modell
+    stream: bool = False                      # strömmat anrop; tidsgränsen blir då en tystnadsgräns
+    stream_total_s: Optional[int] = None      # tak för hela det strömmade svaret
+
+    @property
+    def max_call_s(self) -> int:
+        """Längsta tid ett anrop kan ta, för budgetkontrollen."""
+        if self.stream and self.stream_total_s:
+            return self.stream_total_s
+        return self.request_timeout_s or 0
 
 
 def model_policy(cfg: dict, model: str, tier_timeout_s: Optional[int]) -> ModelPolicy:
@@ -240,4 +249,6 @@ def model_policy(cfg: dict, model: str, tier_timeout_s: Optional[int]) -> ModelP
         max_attempts=max(1, int(p.get("max_attempts", 3))),
         slow_attempt_s=int(p["slow_attempt_s"]) if p.get("slow_attempt_s") else None,
         retry_thinking_level=str(p.get("retry_thinking_level") or ""),
+        stream=bool(p.get("stream", False)),
+        stream_total_s=int(p["stream_total_s"]) if p.get("stream_total_s") else None,
     )
