@@ -223,3 +223,21 @@ def apply_budget(cfg: dict, choice: TierChoice, spent_sek: float) -> TierChoice:
     note = (f"{choice.source}, nedgraderad från {choice.tier}: månadsbudget "
             f"{spent_sek:.2f} av {float(limit):.0f} kr använd")
     return TierChoice(b.get("fallback_tier", "snabb"), note, choice.extra_prompt)
+
+
+@dataclass(frozen=True)
+class ModelPolicy:
+    request_timeout_s: Optional[int]
+    max_attempts: int = 3
+    slow_attempt_s: Optional[int] = None      # misslyckat försök längre än så: direkt till reserven
+    retry_thinking_level: str = ""            # resonemang vid omförsök på samma modell
+
+
+def model_policy(cfg: dict, model: str, tier_timeout_s: Optional[int]) -> ModelPolicy:
+    p = (cfg.get("model_params") or {}).get(model) or {}
+    return ModelPolicy(
+        request_timeout_s=int(p["request_timeout_s"]) if p.get("request_timeout_s") else tier_timeout_s,
+        max_attempts=max(1, int(p.get("max_attempts", 3))),
+        slow_attempt_s=int(p["slow_attempt_s"]) if p.get("slow_attempt_s") else None,
+        retry_thinking_level=str(p.get("retry_thinking_level") or ""),
+    )

@@ -259,6 +259,7 @@ def build_generation_config(
     thinking_level: str,
     grounding: bool = True,
     max_output_tokens: Optional[int] = None,
+    request_timeout_s: Optional[int] = None,
 ) -> tuple[genai.types.GenerateContentConfig, str]:
     """
     Bygger GenerateContentConfig anpassad efter modellfamilj och installerad SDK-version.
@@ -295,6 +296,10 @@ def build_generation_config(
             config_kwargs["thinking_config"] = thinking_cls(thinking_level=thinking_level)
             applied_thinking = thinking_level
 
+    if request_timeout_s:
+        # Per anrop, ersätter klientens tidsgräns (millisekunder i google-genai)
+        config_kwargs["http_options"] = genai.types.HttpOptions(timeout=int(request_timeout_s * 1000))
+
     return genai.types.GenerateContentConfig(**config_kwargs), applied_thinking
 
 
@@ -325,11 +330,12 @@ def classify_error(err: Exception) -> tuple[bool, str]:
         label = SANITIZED_ERROR_LABELS.get(code, f"API-fel ({code or 'okänd kod'})")
         return code in RETRYABLE_STATUS_CODES, label
 
+    # TimeoutException är en underklass till HTTPError och måste prövas först
     if isinstance(err, httpx.TimeoutException):
-        return True, "nätverkstimeout"
+        return True, f"nätverkstimeout ({type(err).__name__})"
 
     if isinstance(err, (httpx.HTTPError, httpx.StreamError)):
-        return True, "tillfälligt nätverksfel"
+        return True, f"tillfälligt nätverksfel ({type(err).__name__})"
 
     return False, f"internt körningsfel ({type(err).__name__})"
 
@@ -503,15 +509,18 @@ def run_resilient_generation(
 
     for model_name in candidate_models:
         grounding = profile_grounding
+        policy = tiers.model_policy(cfg, model_name, profile.request_timeout_s)
+        thinking = tiers.supported_thinking_level(cfg, model_name, profile.thinking_level)
 
         def make_config():
             return build_generation_config(
                 model_name=model_name,
                 system_instruction=effective_system_instruction(system_instruction, grounding),
                 temperature=temperature,
-                thinking_level=tiers.supported_thinking_level(cfg, model_name, profile.thinking_level),
+                thinking_level=thinking,
                 grounding=grounding,
                 max_output_tokens=profile.max_output_tokens,
+                request_timeout_s=policy.request_timeout_s,
             )
 
         config, applied_thinking = make_config()
@@ -519,16 +528,18 @@ def run_resilient_generation(
         delay = 5
         abort_all = False
         attempt = 0
+        max_attempts = policy.max_attempts
 
-        while attempt < 3:
+        while attempt < max_attempts:
             attempt += 1
             elapsed = time.monotonic() - started
-            if budget and elapsed + (profile.request_timeout_s or 0) > budget:
+            if budget and elapsed + (policy.request_timeout_s or 0) > budget:
                 fallback_reasons.append(f"{model_name}: tidsbudget {budget} s räcker inte för ett nytt anrop")
                 log(f"stopp: {int(elapsed)} s använt, budgeten {budget} s räcker inte för ett nytt anrop")
                 abort_all = True
                 break
-            log(f"anrop {attempt}/3 till {model_name} (grounding {'på' if grounding else 'av'})")
+            log(f"anrop {attempt}/{max_attempts} till {model_name} (grounding {'på' if grounding else 'av'}, "
+                f"resonemang {applied_thinking or 'standard'}, tidsgräns {policy.request_timeout_s or 'ingen'} s)")
             t0 = time.monotonic()
             done = threading.Event()
 
@@ -567,7 +578,17 @@ def run_resilient_generation(
                     fallback_reasons.append(f"{model_name}: {sanitized_reason}")
                     abort_all = True
                     break
-                if attempt < 3:
+                took = time.monotonic() - t0
+                if policy.slow_attempt_s and took > policy.slow_attempt_s:
+                    # Ett långsamt misslyckande upprepas inte: spara budgeten åt reservmodellen
+                    fallback_reasons.append(f"{model_name}: {sanitized_reason} efter {int(took)} s")
+                    log(f"{model_name}: försöket tog {int(took)} s (> {policy.slow_attempt_s} s), direkt till reserven")
+                    break
+                if attempt < max_attempts:
+                    if policy.retry_thinking_level and policy.retry_thinking_level != thinking:
+                        thinking = tiers.supported_thinking_level(cfg, model_name, policy.retry_thinking_level)
+                        config, applied_thinking = make_config()
+                        log(f"omförsök på {model_name} med resonemang {applied_thinking}")
                     time.sleep(delay)
                     delay *= 2
                 else:

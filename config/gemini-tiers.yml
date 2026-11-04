@@ -62,10 +62,19 @@ tiers:
 # Vad varje modell stöder (verifierat med tools/smoke_test.py på Vertex AI global, 2026-11-01).
 # En nivås thinking_level som modellen inte stöder höjs till närmaste stödda nivå uppåt.
 # gemini-2.5-pro listas av models.list() men ger 404 på global och används därför inte i nivåerna.
+# Per modell: thinking_levels som stöds, och valfritt request_timeout_s (ersätter nivåns),
+# max_attempts (standard 3), slow_attempt_s och retry_thinking_level.
 model_params:
   gemini-3.8-flash:       {thinking_levels: [low, medium, high]}       # MINIMAL ger 400
   gemini-3.1-pro-preview: {thinking_levels: [low, medium, high]}
-  gemini-4-argon:         {thinking_levels: [low, medium, high]}       # low/medium ej provade
+  # Tung modell: kort timeout per anrop, högst ett omförsök (med lägre resonemang), och direkt till
+  # reserven om ett misslyckat försök redan tagit mer än slow_attempt_s. Lämnar budget åt reserven.
+  gemini-4-argon:
+    thinking_levels: [low, medium, high]
+    request_timeout_s: 300
+    max_attempts: 2
+    slow_attempt_s: 180
+    retry_thinking_level: medium
   gemini-2.5-pro:         {thinking_levels: [], thinking_budget: true}
 
 # Gamla profilnamn (GEMINI_PROFILE) pekar på en nivå.

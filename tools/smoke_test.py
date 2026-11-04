@@ -39,7 +39,8 @@ def main() -> int:
         client = get_gemini_client(timeout_s=t.request_timeout_s)
         for i, model in enumerate(t.models):
             level = tiers.supported_thinking_level(cfg, model, t.thinking_level)
-            full = dict(thinking_level=level, grounding=t.grounding, max_output_tokens=t.max_output_tokens)
+            full = dict(thinking_level=level, grounding=t.grounding, max_output_tokens=t.max_output_tokens,
+                        request_timeout_s=tiers.model_policy(cfg, model, t.request_timeout_s).request_timeout_s)
             res = call(client, model, **full)
             log(f"{name}/{model}: {'OK' if res[0] else 'FEL'} – {res[1]}")
             if res[0]:

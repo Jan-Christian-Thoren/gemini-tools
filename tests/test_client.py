@@ -114,8 +114,10 @@ def test_429_triggers_allowed_fallback_with_sanitized_reason(monkeypatch):
 
 
 def test_network_error_is_retryable():
-    assert c.classify_error(httpx.ReadTimeout("x")) == (True, "nätverkstimeout")
-    assert c.classify_error(httpx.ConnectError("x"))[0] is True
+    assert c.classify_error(httpx.ReadTimeout("x")) == (True, "nätverkstimeout (ReadTimeout)")
+    assert c.classify_error(httpx.ConnectError("x")) == (True, "tillfälligt nätverksfel (ConnectError)")
+    assert c.classify_error(httpx.RemoteProtocolError("x")) == \
+        (True, "tillfälligt nätverksfel (RemoteProtocolError)")
 
 
 @pytest.mark.parametrize(
@@ -418,3 +420,94 @@ def test_budget_counts_only_bot_comments_this_month(monkeypatch):
     assert c.repo_spend_this_month(Repo()) == 30.0
     ch = c.apply_repo_budget(Repo(), tiers.load_config(), tiers.TierChoice("standard", "label"))
     assert ch.tier == "snabb"
+
+
+
+# --- tung modell: timeout, omförsök och reserv -----------------------------------------------------
+
+class RecordingModels(FakeModels):
+    """Spelar upp en lista utfall per modell och sparar config för varje anrop."""
+    def __init__(self, names, script, clock=None, durations=None):
+        super().__init__(names, {})
+        self.script = {m: list(v) for m, v in script.items()}
+        self.configs = []
+        self.clock = clock
+        self.durations = durations or {}
+
+    def generate_content(self, model, contents, config):
+        self.calls.append(model)
+        self.configs.append((model, config))
+        if self.clock is not None:
+            self.clock["t"] += self.durations.get(model, 1)
+        outcome = self.script[model].pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+def install_script(monkeypatch, script, durations=None):
+    clock = {"t": 0.0}
+    monkeypatch.setattr(c.time, "monotonic", lambda: clock["t"])
+    fake = FakeClient(list(c.ALL_APPROVED_MODELS), {})
+    fake.models = RecordingModels(list(c.ALL_APPROVED_MODELS), script, clock, durations)
+    monkeypatch.setattr(c, "get_gemini_client", lambda **kw: fake)
+    return fake
+
+
+def test_argon_gets_its_own_300_s_request_timeout(monkeypatch):
+    fake = install_script(monkeypatch, {"gemini-4-argon": [ok_response()]})
+    assert c.run_resilient_generation("p", "sys", profile_name="djup").success
+    _, cfg = fake.models.configs[0]
+    assert cfg.http_options.timeout == 300_000
+
+
+def test_reserve_model_keeps_the_tier_timeout(monkeypatch):
+    fake = install_script(monkeypatch, {"gemini-4-argon": [api_error(404)],
+                                        "gemini-3.1-pro-preview": [ok_response()]})
+    assert c.run_resilient_generation("p", "sys", profile_name="djup").success
+    _, cfg = fake.models.configs[-1]
+    assert cfg.http_options.timeout == c.PROFILES["djup"].request_timeout_s * 1000
+
+
+def test_argon_timeout_retried_once_with_lower_thinking_then_reserve(monkeypatch):
+    fake = install_script(monkeypatch, {
+        "gemini-4-argon": [httpx.ReadTimeout("x"), httpx.ReadTimeout("x")],
+        "gemini-3.1-pro-preview": [ok_response()],
+    }, durations={"gemini-4-argon": 100})
+    r = c.run_resilient_generation("p", "sys", profile_name="djup")
+    assert r.success and r.chosen_model == "gemini-3.1-pro-preview"
+    assert fake.models.calls == ["gemini-4-argon", "gemini-4-argon", "gemini-3.1-pro-preview"]
+    levels = [str(cfg.thinking_config.thinking_level).lower() for m, cfg in fake.models.configs if m == "gemini-4-argon"]
+    assert "high" in levels[0] and "medium" in levels[1]
+    assert "nätverkstimeout (ReadTimeout)" in r.audit_md
+
+
+def test_slow_argon_failure_goes_straight_to_reserve(monkeypatch):
+    fake = install_script(monkeypatch, {
+        "gemini-4-argon": [httpx.RemoteProtocolError("x")],
+        "gemini-3.1-pro-preview": [ok_response()],
+    }, durations={"gemini-4-argon": 270})
+    r = c.run_resilient_generation("p", "sys", profile_name="djup")
+    assert r.success and fake.models.calls == ["gemini-4-argon", "gemini-3.1-pro-preview"]
+    assert "RemoteProtocolError" in r.audit_md and "efter 270 s" in r.audit_md
+
+
+def test_worst_case_argon_leaves_budget_for_the_reserve(monkeypatch):
+    # två fulla timeouts på argon (2 x 300 s + väntan) ska lämna plats för reservens hela tidsgräns
+    install_script(monkeypatch, {
+        "gemini-4-argon": [httpx.ReadTimeout("x"), httpx.ReadTimeout("x")],
+        "gemini-3.1-pro-preview": [ok_response()],
+    }, durations={"gemini-4-argon": 179})
+    r = c.run_resilient_generation("p", "sys", profile_name="djup")
+    assert r.success and r.chosen_model == "gemini-3.1-pro-preview"
+    djup = c.PROFILES["djup"]
+    policy = c.tiers.model_policy(c.tiers.load_config(), "gemini-4-argon", djup.request_timeout_s)
+    worst = policy.max_attempts * policy.request_timeout_s + 5
+    assert worst + djup.request_timeout_s <= djup.run_budget_s
+
+
+def test_other_models_keep_three_attempts(monkeypatch):
+    fake = install_script(monkeypatch, {"gemini-3.8-flash": [httpx.ReadTimeout("x"), httpx.ReadTimeout("x"),
+                                                             ok_response()]})
+    assert c.run_resilient_generation("p", "sys", profile_name="snabb").success
+    assert fake.models.calls == ["gemini-3.8-flash"] * 3
