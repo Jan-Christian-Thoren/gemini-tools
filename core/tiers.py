@@ -243,7 +243,7 @@ class ModelPolicy:
 
 
 def model_policy(cfg: dict, model: str, tier_timeout_s: Optional[int]) -> ModelPolicy:
-    p = (cfg.get("model_params") or {}).get(model) or {}
+    p = {**(cfg.get("model_defaults") or {}), **((cfg.get("model_params") or {}).get(model) or {})}
     return ModelPolicy(
         request_timeout_s=int(p["request_timeout_s"]) if p.get("request_timeout_s") else tier_timeout_s,
         max_attempts=max(1, int(p.get("max_attempts", 3))),

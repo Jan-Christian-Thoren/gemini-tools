@@ -466,12 +466,13 @@ def test_argon_gets_its_own_300_s_request_timeout(monkeypatch):
     assert cfg.http_options.timeout == 300_000
 
 
-def test_reserve_model_keeps_the_tier_timeout(monkeypatch):
+def test_every_model_gets_a_300_s_timeout_in_milliseconds(monkeypatch):
     fake = install_script(monkeypatch, {"gemini-4-argon": [api_error(404)],
                                         "gemini-3.1-pro-preview": [ok_response()]})
     assert c.run_resilient_generation("p", "sys", profile_name="djup").success
-    _, cfg = fake.models.configs[-1]
-    assert cfg.http_options.timeout == c.PROFILES["djup"].request_timeout_s * 1000
+    fake2 = install_script(monkeypatch, {"gemini-3.8-flash": [ok_response()]})
+    assert c.run_resilient_generation("p", "sys", profile_name="snabb").success
+    assert [cfg.http_options.timeout for _, cfg in fake.models.configs + fake2.models.configs] == [300_000] * 3
 
 
 def test_argon_timeout_retried_once_with_lower_thinking_then_reserve(monkeypatch):
@@ -549,16 +550,43 @@ def test_merge_stream_without_content_is_rejected():
     assert not c.validate_response(c.merge_stream([]))[0]
 
 
-def test_argon_is_streamed_with_thought_summaries_and_others_are_not(monkeypatch):
-    fake = install_script(monkeypatch, {"gemini-4-argon": [ok_response()]})
-    assert c.run_resilient_generation("p", "sys", profile_name="djup").success
-    assert fake.models.streamed == ["gemini-4-argon"]
-    _, cfg = fake.models.configs[0]
-    assert cfg.thinking_config.include_thoughts is True
+def test_all_levels_are_streamed_with_thought_summaries(monkeypatch):
+    for tier, model in (("djup", "gemini-4-argon"), ("standard", "gemini-3.1-pro-preview"),
+                        ("snabb", "gemini-3.8-flash")):
+        fake = install_script(monkeypatch, {model: [ok_response()]})
+        assert c.run_resilient_generation("p", "sys", profile_name=tier).success
+        assert fake.models.streamed == [model]
+        _, cfg = fake.models.configs[0]
+        assert cfg.thinking_config.include_thoughts is True
 
-    fake = install_script(monkeypatch, {"gemini-3.8-flash": [ok_response()]})
-    assert c.run_resilient_generation("p", "sys", profile_name="snabb").success
-    assert getattr(fake.models, "streamed", []) == []
+
+def test_client_without_streaming_uses_a_plain_call():
+    class Plain:
+        def generate_content(self, model, contents, config):
+            return ok_response("vanligt")
+    r = c.generate(SimpleNamespace(models=Plain()), "gemini-3.8-flash", "p", SimpleNamespace(thinking_config=None))
+    assert r.text == "vanligt"
+
+
+def test_merge_stream_over_many_chunks_keeps_text_finish_and_sources():
+    web = SimpleNamespace(web=SimpleNamespace(uri="https://example.org/a", title="Källa A"))
+    g = SimpleNamespace(grounding_chunks=[web])
+    r = c.merge_stream([chunk("Del 1. "), chunk(None, finish=None), chunk("Del 2. "),
+                        chunk("Del 3.", finish="FinishReason.STOP"), chunk(None, grounding=g)])
+    assert r.text == "Del 1. Del 2. Del 3."
+    assert r.candidates[0].finish_reason == "FinishReason.STOP"
+    assert c.validate_response(r)[0] is True
+    assert "[Källa A](https://example.org/a)" in c._extract_sources(r)
+
+
+def test_timeout_after_more_than_120_s_goes_straight_to_the_next_model(monkeypatch):
+    fake = install_script(monkeypatch, {
+        "gemini-4-argon": [httpx.ReadTimeout("x"), ok_response()],
+        "gemini-3.1-pro-preview": [ok_response()],
+    }, durations={"gemini-4-argon": 121})
+    r = c.run_resilient_generation("p", "sys", profile_name="djup")
+    assert r.success and fake.models.calls == ["gemini-4-argon", "gemini-3.1-pro-preview"]
+    assert "nätverkstimeout (ReadTimeout) efter 121 s" in r.audit_md
 
 
 def test_error_inside_the_stream_is_handled_like_a_call_error(monkeypatch):
@@ -588,11 +616,15 @@ def test_stream_longer_than_its_cap_is_a_timeout(monkeypatch):
 
 
 def test_no_retry_on_argon_when_it_would_starve_the_reserve(monkeypatch):
-    # 150 s in: ett nytt argon-försök (600 s) plus reservens 660 s ryms inte i budgeten 1380 s
+    # utan 120 s-regeln: 200 s in ryms inte ett nytt argon-försök (600 s) plus reservens 600 s i 1380 s
+    from core import tiers
+    cfg = tiers.load_config()
+    cfg["model_params"]["gemini-4-argon"]["slow_attempt_s"] = 1000
+    monkeypatch.setattr(c.tiers, "load_config", lambda *a, **k: cfg)
     fake = install_script(monkeypatch, {
         "gemini-4-argon": [httpx.ConnectError("x"), ok_response()],
         "gemini-3.1-pro-preview": [ok_response()],
-    }, durations={"gemini-4-argon": 150})
+    }, durations={"gemini-4-argon": 200})
     r = c.run_resilient_generation("p", "sys", profile_name="djup")
     assert r.success and fake.models.calls == ["gemini-4-argon", "gemini-3.1-pro-preview"]
     assert "inget omförsök" in r.audit_md

@@ -470,13 +470,21 @@ def _bounded(chunks, max_total_s: Optional[int]):
             raise httpx.ReadTimeout(f"strömmat svar längre än {max_total_s} s")
 
 
-def generate(client, model: str, prompt: str, config, stream: bool = False, max_total_s: Optional[int] = None):
-    if not stream:
-        return client.models.generate_content(model=model, contents=prompt, config=config)
+def _call_model_streaming(client, model_name: str, contents, config, max_total_s: Optional[int] = None):
+    """Strömmat anrop (Google Clouds rekommendation för långa svar): delsvar kommer löpande,
+    också resonemangssammanfattningar, så förbindelsen tystnar aldrig. Returnerar ett samlat svar
+    som validate_response() och källutvinningen läser precis som ett vanligt svar."""
     if getattr(config, "thinking_config", None) is not None:
         config.thinking_config.include_thoughts = True   # håller strömmen vid liv under resonemanget
-    stream_iter = client.models.generate_content_stream(model=model, contents=prompt, config=config)
+    stream_iter = client.models.generate_content_stream(model=model_name, contents=contents, config=config)
     return merge_stream(_bounded(stream_iter, max_total_s))
+
+
+def generate(client, model: str, prompt: str, config, stream: bool = True, max_total_s: Optional[int] = None):
+    # Vanligt anrop bara om strömning är avslagen för modellen, eller klienten saknar strömning
+    if not stream or not hasattr(client.models, "generate_content_stream"):
+        return client.models.generate_content(model=model, contents=prompt, config=config)
+    return _call_model_streaming(client, model, prompt, config, max_total_s)
 
 
 def run_resilient_generation(
@@ -571,7 +579,8 @@ def run_resilient_generation(
         while attempt < max_attempts:
             attempt += 1
             elapsed = time.monotonic() - started
-            if budget and elapsed + policy.max_call_s > budget:
+            # Ett nytt anrop kräver minst en hel tystnadsgräns kvar; strömmen kapas vid budgeten
+            if budget and elapsed + (policy.request_timeout_s or 0) > budget:
                 fallback_reasons.append(f"{model_name}: tidsbudget {budget} s räcker inte för ett nytt anrop")
                 log(f"stopp: {int(elapsed)} s använt, budgeten {budget} s räcker inte för ett nytt anrop")
                 abort_all = True
@@ -587,8 +596,11 @@ def run_resilient_generation(
                     log(f"väntar på svar från {model}: {int(time.monotonic() - t_start)} s")
             threading.Thread(target=heartbeat, daemon=True).start()
             try:
-                resp = generate(client, model_name, prompt, config, stream=policy.stream,
-                                max_total_s=policy.stream_total_s)
+                cap = policy.stream_total_s
+                if budget:
+                    left = int(budget - (time.monotonic() - started))
+                    cap = min(cap, left) if cap else left
+                resp = generate(client, model_name, prompt, config, stream=policy.stream, max_total_s=cap)
                 log(f"svar från {model_name} efter {int(time.monotonic() - t0)} s")
             except Exception as err:
                 log(f"fel från {model_name} efter {int(time.monotonic() - t0)} s: {classify_error(err)[1]}"
@@ -615,13 +627,14 @@ def run_resilient_generation(
                     abort_all = True
                     break
                 took = time.monotonic() - t0
-                if policy.slow_attempt_s and took > policy.slow_attempt_s:
-                    # Ett långsamt misslyckande upprepas inte: spara budgeten åt reservmodellen
+                rest = candidate_models[candidate_models.index(model_name) + 1:]
+                if rest and policy.slow_attempt_s and took > policy.slow_attempt_s:
+                    # Ett långsamt misslyckande upprepas inte: nästa modell får budgeten
                     fallback_reasons.append(f"{model_name}: {sanitized_reason} efter {int(took)} s")
-                    log(f"{model_name}: försöket tog {int(took)} s (> {policy.slow_attempt_s} s), direkt till reserven")
+                    log(f"{model_name}: {sanitized_reason} efter {int(took)} s (> {policy.slow_attempt_s} s), "
+                        f"direkt till {rest[0]}")
                     break
                 # Omförsök bara om reservmodellen ändå får hela sin tidsgräns efteråt
-                rest = candidate_models[candidate_models.index(model_name) + 1:]
                 reserve_s = tiers.model_policy(cfg, rest[0], profile.request_timeout_s).max_call_s if rest else 0
                 if (attempt < max_attempts and budget and rest
                         and time.monotonic() - started + delay + policy.max_call_s + reserve_s > budget):

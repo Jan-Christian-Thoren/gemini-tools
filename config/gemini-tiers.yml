@@ -62,23 +62,30 @@ tiers:
 # Vad varje modell stöder (verifierat med tools/smoke_test.py på Vertex AI global, 2026-11-01).
 # En nivås thinking_level som modellen inte stöder höjs till närmaste stödda nivå uppåt.
 # gemini-2.5-pro listas av models.list() men ger 404 på global och används därför inte i nivåerna.
-# Per modell: thinking_levels som stöds, och valfritt request_timeout_s (ersätter nivåns),
-# max_attempts (standard 3), slow_attempt_s, retry_thinking_level och stream.
+# Anropsregler för alla modeller; model_params kan ändra dem per modell.
+# - stream: strömmat svar (generate_content_stream) med resonemangssammanfattningar, så att
+#   förbindelsen aldrig är tyst under långt resonemang. Utan strömning stängdes den efter ~320 s
+#   (RemoteProtocolError, ev-core#21). Rekommendation från Google Cloud för långa svar.
+# - request_timeout_s: tidsgräns per anrop (HttpOptions, millisekunder i google-genai). Med strömning
+#   gäller den tystnad mellan delsvar; hela svaret begränsas av stream_total_s och nivåns budget.
+# - slow_attempt_s: ett nätverksfel efter längre tid än så görs inte om, nästa modell tar över.
+# - max_attempts: försök per modell vid övergående fel.
+model_defaults:
+  stream: true
+  request_timeout_s: 300
+  stream_total_s: 600
+  slow_attempt_s: 120
+  max_attempts: 3
+
+# Vad varje modell stöder och avvikelser från model_defaults.
 model_params:
   gemini-3.8-flash:       {thinking_levels: [low, medium, high]}       # MINIMAL ger 400
   gemini-3.1-pro-preview: {thinking_levels: [low, medium, high]}
-  # Tung modell: kort timeout per anrop, högst ett omförsök (med lägre resonemang), och direkt till
-  # reserven om ett misslyckat försök redan tagit mer än slow_attempt_s. Lämnar budget åt reserven.
+  # Tung modell: högst ett omförsök, med lägre resonemang.
   gemini-4-argon:
     thinking_levels: [low, medium, high]
-    request_timeout_s: 300
     max_attempts: 2
-    slow_attempt_s: 180
     retry_thinking_level: medium
-    # Strömmat svar med resonemangssammanfattningar: förbindelsen är aldrig tyst under långt
-    # resonemang. Utan strömning stängdes den efter ~320 s (RemoteProtocolError, ev-core#21).
-    stream: true
-    stream_total_s: 600            # tak för hela det strömmade svaret
   gemini-2.5-pro:         {thinking_levels: [], thinking_budget: true}
 
 # Gamla profilnamn (GEMINI_PROFILE) pekar på en nivå.
